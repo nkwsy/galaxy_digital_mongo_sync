@@ -1,7 +1,8 @@
+import logging
 import os
 import time
 import json
-import logging
+from loguru import logger
 import datetime
 import requests
 from typing import Dict, List, Any, Optional, Union
@@ -11,19 +12,12 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 from dotenv import load_dotenv
 
+
 # Load environment variables from .env file
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("galaxy_sync.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("galaxy_api_sync")
+
 
 class GalaxyAPISync:
     """
@@ -39,9 +33,10 @@ class GalaxyAPISync:
         """
         self.config = self._load_config(config_path)
         self.api_base_url = self.config.get("api_base_url", "https://api.galaxydigital.com/api")
-        self.token = os.getenv("GALAXY_API_TOKEN")
-        if not self.token:
-            raise ValueError("API token not found in environment variables")
+        self.email = os.getenv("GALAXY_EMAIL")
+        self.password = os.getenv("GALAXY_PASSWORD")
+        if not self.email or not self.password:
+            raise ValueError("Email and password not found in environment variables")
         
         # Connect to MongoDB
         self.client = MongoClient(self.config.get("mongodb_uri", "mongodb://localhost:27017/"))
@@ -53,9 +48,97 @@ class GalaxyAPISync:
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
+
+        self.session = requests.Session()
+        self.token = None
+        self.login_response = None
+
+        self._login()
         
         logger.info(f"Initialized Galaxy API Sync with base URL: {self.api_base_url}")
-    
+
+    def _login(self, max_retries: int = 3, retry_delay: int = 2) -> Optional[str]:
+        """
+        Authenticate with the Galaxy Digital API.
+        
+        Args:
+            max_retries: Maximum number of login attempts
+            retry_delay: Delay between retries in seconds
+            
+        Returns:
+            Authentication token or None if authentication failed
+        """
+        login_url = f"{self.base_url}/users/login"
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        }
+        data = {
+            'key': self.api_key,
+            'user_email': self.email,
+            'user_password': self.password,
+        }
+        
+        if self.debug:
+            # Mask password in debug output
+            debug_data = data.copy()
+            if 'user_password' in debug_data:
+                debug_data['user_password'] = '********'
+            logging.debug(f"Login request to {login_url} with data: {json.dumps(debug_data)}")
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(login_url, headers=headers, json=data)
+                
+                if self.debug:
+                    logging.debug(f"Login response status: {response.status_code}")
+                    if response.status_code != 200:
+                        logging.debug(f"Response content: {response.text[:500]}...")
+                
+                # Handle different response status codes
+                if response.status_code == 200:
+                    resp_data = response.json()
+                    self.login_response = resp_data.get('data', {})
+                    self.token = self.login_response.get('token')
+                    
+                    if not self.token:
+                        logging.error("Authentication succeeded but no token was returned")
+                        return None
+                    
+                    # Update session headers with token
+                    self.session.headers.update({
+                        'Accept': 'application/json',
+                        'Authorization': f"Bearer {self.token}"
+                    })
+                    
+                    logging.info("Successfully authenticated with Galaxy Digital API")
+                    return self.token
+                elif response.status_code == 401:
+                    logging.error("Authentication failed: Invalid credentials")
+                    return None
+                elif response.status_code == 500:
+                    if attempt < max_retries - 1:
+                        logging.warning(f"Server error during login (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                    else:
+                        logging.error("Server error during login. Max retries exceeded.")
+                        response.raise_for_status()
+                else:
+                    response.raise_for_status()
+                    
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error authenticating with Galaxy Digital API: {str(e)}")
+                if hasattr(e, 'response') and e.response:
+                    logging.error(f"Response: {e.response.text[:500]}...")
+                
+                if attempt < max_retries - 1:
+                    logging.warning(f"Retrying login in {retry_delay} seconds... (attempt {attempt+1}/{max_retries})")
+                    time.sleep(retry_delay)
+                else:
+                    logging.error("Max retries exceeded for login")
+                    raise
+        
+        return None
     def _load_config(self, config_path: str) -> Dict:
         """
         Load configuration from a JSON file.
@@ -86,7 +169,7 @@ class GalaxyAPISync:
         """
         url = f"{self.api_base_url}/{endpoint}"
         try:
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self.session.request('GET', url, headers=self.headers, params=params)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
