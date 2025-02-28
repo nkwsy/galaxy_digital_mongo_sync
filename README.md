@@ -195,7 +195,7 @@ You can generate these reports in several ways:
    GENERATE_SPECIFIC_REPORT=user python galaxy-api-sync.py
    ```
    
-   Available options: `user`, `opportunity`, `agency`, `time`
+   Available options: `user`, `needs`, `opportunity`, `agency`, `time`
 
 ### Using Aggregated Data
 

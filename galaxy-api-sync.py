@@ -13,6 +13,7 @@ from pymongo.database import Database
 from dotenv import load_dotenv
 import sys
 
+print("Script is starting...")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -677,14 +678,14 @@ class GalaxyAPISync:
         Generate a specific activity report.
         
         Args:
-            report_type: Type of report to generate ('user', 'opportunity', 'agency', 'time')
+            report_type: Type of report to generate ('user', 'needs', 'opportunity', 'agency', 'time')
         """
         logger.info(f"Generating specific report: {report_type}")
         
         try:
             if report_type.lower() == 'user':
                 self._generate_user_activity_summary()
-            elif report_type.lower() == 'opportunity':
+            elif report_type.lower() == 'needs' or report_type.lower() == 'opportunity':
                 self._generate_opportunity_activity()
             elif report_type.lower() == 'agency':
                 self._generate_agency_activity()
@@ -692,7 +693,7 @@ class GalaxyAPISync:
                 self._generate_time_based_activity()
             else:
                 logger.warning(f"Unknown report type: {report_type}")
-                raise ValueError(f"Unknown report type: {report_type}")
+                raise ValueError(f"Unknown report type: {report_type}. Valid options are: user, needs, opportunity, agency, time")
                 
             logger.info(f"Successfully generated {report_type} report")
             
@@ -714,6 +715,11 @@ class GalaxyAPISync:
         logger.info("Generating user activity summary...")
         
         try:
+            # Check if the hours collection exists and has data
+            if "hours" not in self.db.list_collection_names() or self.db["hours"].count_documents({}) == 0:
+                logger.warning("No data available in hours collection. Skipping user activity summary generation.")
+                return
+                
             # Define the aggregation pipeline
             pipeline = [
                 # Match only approved hours
@@ -759,17 +765,17 @@ class GalaxyAPISync:
             ]
             
             # Run the aggregation and store results
-            result = self.db["hours"].aggregate(pipeline, allowDiskUse=True)
+            result = list(self.db["hours"].aggregate(pipeline, allowDiskUse=True))
             
             # Clear the existing collection
             self.db["user_activity_summary"].delete_many({})
             
             # Insert the aggregation results
             if result:
-                self.db["user_activity_summary"].insert_many(list(result))
-                logger.info("User activity summary generated successfully")
+                self.db["user_activity_summary"].insert_many(result)
+                logger.info(f"User activity summary generated successfully with {len(result)} records")
             else:
-                logger.warning("No data available for user activity summary")
+                logger.warning("No data available for user activity summary after aggregation")
                 
         except Exception as e:
             logger.error(f"Error generating user activity summary: {str(e)}")
@@ -788,6 +794,11 @@ class GalaxyAPISync:
         logger.info("Generating opportunity activity metrics...")
         
         try:
+            # Check if the hours collection exists and has data
+            if "hours" not in self.db.list_collection_names() or self.db["hours"].count_documents({}) == 0:
+                logger.warning("No data available in hours collection. Skipping opportunity activity metrics generation.")
+                return
+                
             # Define the aggregation pipeline
             pipeline = [
                 # Match only approved hours
@@ -835,17 +846,17 @@ class GalaxyAPISync:
             ]
             
             # Run the aggregation and store results
-            result = self.db["hours"].aggregate(pipeline, allowDiskUse=True)
+            result = list(self.db["hours"].aggregate(pipeline, allowDiskUse=True))
             
             # Clear the existing collection
             self.db["opportunity_activity"].delete_many({})
             
             # Insert the aggregation results
             if result:
-                self.db["opportunity_activity"].insert_many(list(result))
-                logger.info("Opportunity activity metrics generated successfully")
+                self.db["opportunity_activity"].insert_many(result)
+                logger.info(f"Opportunity activity metrics generated successfully with {len(result)} records")
             else:
-                logger.warning("No data available for opportunity activity metrics")
+                logger.warning("No data available for opportunity activity metrics after aggregation")
                 
         except Exception as e:
             logger.error(f"Error generating opportunity activity metrics: {str(e)}")
@@ -864,6 +875,11 @@ class GalaxyAPISync:
         logger.info("Generating agency activity metrics...")
         
         try:
+            # Check if the hours collection exists and has data
+            if "hours" not in self.db.list_collection_names() or self.db["hours"].count_documents({}) == 0:
+                logger.warning("No data available in hours collection. Skipping agency activity metrics generation.")
+                return
+                
             # Define the aggregation pipeline
             pipeline = [
                 # Match only approved hours
@@ -923,17 +939,17 @@ class GalaxyAPISync:
             ]
             
             # Run the aggregation and store results
-            result = self.db["hours"].aggregate(pipeline, allowDiskUse=True)
+            result = list(self.db["hours"].aggregate(pipeline, allowDiskUse=True))
             
             # Clear the existing collection
             self.db["agency_activity"].delete_many({})
             
             # Insert the aggregation results
             if result:
-                self.db["agency_activity"].insert_many(list(result))
-                logger.info("Agency activity metrics generated successfully")
+                self.db["agency_activity"].insert_many(result)
+                logger.info(f"Agency activity metrics generated successfully with {len(result)} records")
             else:
-                logger.warning("No data available for agency activity metrics")
+                logger.warning("No data available for agency activity metrics after aggregation")
                 
         except Exception as e:
             logger.error(f"Error generating agency activity metrics: {str(e)}")
@@ -951,6 +967,11 @@ class GalaxyAPISync:
         logger.info("Generating time-based activity reports...")
         
         try:
+            # Check if the hours collection exists and has data
+            if "hours" not in self.db.list_collection_names() or self.db["hours"].count_documents({}) == 0:
+                logger.warning("No data available in hours collection. Skipping time-based activity reports generation.")
+                return
+                
             # 1. Monthly activity summary
             monthly_pipeline = [
                 # Match only approved hours
@@ -991,17 +1012,17 @@ class GalaxyAPISync:
             ]
             
             # Run the monthly aggregation and store results
-            monthly_result = self.db["hours"].aggregate(monthly_pipeline, allowDiskUse=True)
+            monthly_result = list(self.db["hours"].aggregate(monthly_pipeline, allowDiskUse=True))
             
             # Clear the existing collection
             self.db["monthly_activity"].delete_many({})
             
             # Insert the aggregation results
             if monthly_result:
-                self.db["monthly_activity"].insert_many(list(monthly_result))
-                logger.info("Monthly activity report generated successfully")
+                self.db["monthly_activity"].insert_many(monthly_result)
+                logger.info(f"Monthly activity report generated successfully with {len(monthly_result)} records")
             else:
-                logger.warning("No data available for monthly activity report")
+                logger.warning("No data available for monthly activity report after aggregation")
             
             # 2. Day of week activity patterns
             # This would require date processing which is complex in MongoDB aggregation
