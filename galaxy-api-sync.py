@@ -11,6 +11,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 from dotenv import load_dotenv
+import sys
 
 
 # Load environment variables from .env file
@@ -236,7 +237,7 @@ class GalaxyAPISync:
     
     def _make_api_request(self, endpoint: str, params: Dict = None) -> Dict:
         """
-        Make a request to the Galaxy Digital API.
+        Make a request to the Galaxy Digital API with retries and rate limiting handling.
         
         Args:
             endpoint: API endpoint
@@ -246,13 +247,55 @@ class GalaxyAPISync:
             API response as dictionary
         """
         url = f"{self.api_base_url}/{endpoint}"
-        try:
-            response = self.session.request('GET', url, headers=self.headers, params=params)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {str(e)}, URL: {url}")
-            raise
+        max_retries = 3
+        retry_delay = 2
+        rate_limit_delay = 60  # Default delay for rate limiting
+        
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"Making API request to {url} (attempt {attempt+1}/{max_retries})")
+                response = self.session.request('GET', url, headers=self.headers, params=params)
+                
+                # Check for rate limiting (status code 429)
+                if response.status_code == 429:
+                    # Get retry-after header if available
+                    retry_after = int(response.headers.get('Retry-After', rate_limit_delay))
+                    logger.warning(f"Rate limit exceeded. Waiting for {retry_after} seconds before retrying...")
+                    time.sleep(retry_after)
+                    continue
+                
+                # Check for authentication issues (status code 401)
+                if response.status_code == 401:
+                    logger.warning("Authentication token expired. Refreshing token...")
+                    self._login()  # Refresh the token
+                    self.headers["Authorization"] = f"Bearer {self.token}"
+                    continue
+                
+                # Check for server errors (5xx)
+                if 500 <= response.status_code < 600:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)  # Exponential backoff
+                        logger.warning(f"Server error {response.status_code}. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        continue
+                
+                # Raise for other error status codes
+                response.raise_for_status()
+                
+                # Parse and return the JSON response
+                return response.json()
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (attempt + 1)
+                    logger.warning(f"API request failed: {str(e)}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"API request failed after {max_retries} attempts: {str(e)}")
+                    raise
+        
+        # This should not be reached, but just in case
+        raise requests.exceptions.RequestException(f"Failed to make API request to {url} after {max_retries} attempts")
     
     def _update_document(self, collection: Collection, document: Dict, id_field: str = "id") -> None:
         """
@@ -320,7 +363,7 @@ class GalaxyAPISync:
         collection = self.db[f"{resource_name}"]
         
         # Prepare query parameters
-        query_params = params or {}
+        query_params = params.copy() if params else {}
         
         # Add a since parameter if specified and we have a last sync time
         if since_field:
@@ -332,42 +375,79 @@ class GalaxyAPISync:
         # Add pagination parameters
         query_params.setdefault("per_page", 100)
         
-        try:
-            # Make the API request
-            response = self._make_api_request(resource_name, query_params)
-            
-            # Check if we have data
-            if "data" not in response:
-                logger.warning(f"No data found in response for {resource_name}")
-                return
-            
-            # Process each item with MongoDB error handling
-            successful_items = 0
-            failed_items = 0
-            
-            for item in response["data"]:
-                try:
-                    self._update_document(collection, item)
-                    successful_items += 1
-                except pymongo.errors.PyMongoError as e:
-                    failed_items += 1
-                    logger.error(f"MongoDB error while updating item {item.get('id', 'unknown')} for {resource_name}: {str(e)}")
-            
-            logger.info(f"Synced {successful_items} items for {resource_name} (failed: {failed_items})")
-            
-            # Only update the last sync time if we had some successful updates
-            if successful_items > 0:
-                self._update_sync_metadata(resource_name)
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request error for {resource_name}: {str(e)}")
-            raise
-        except pymongo.errors.PyMongoError as e:
-            logger.error(f"MongoDB error for {resource_name}: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Error syncing {resource_name}: {str(e)}")
-            raise
+        # Initialize counters for total items
+        total_successful_items = 0
+        total_failed_items = 0
+        current_page = 1
+        has_more_pages = True
+        
+        # Process all pages
+        while has_more_pages:
+            try:
+                # Set the current page
+                query_params["page"] = current_page
+                
+                logger.info(f"Fetching page {current_page} for {resource_name}")
+                
+                # Make the API request
+                response = self._make_api_request(resource_name, query_params)
+                
+                # Check if we have data
+                if "data" not in response:
+                    logger.warning(f"No data found in response for {resource_name} on page {current_page}")
+                    break
+                
+                # Get the items for this page
+                items = response["data"]
+                
+                # If we got fewer items than per_page, this is the last page
+                per_page = int(query_params.get("per_page", 100))
+                if len(items) < per_page:
+                    has_more_pages = False
+                    logger.info(f"Reached last page ({current_page}) for {resource_name}")
+                
+                # Process each item with MongoDB error handling
+                page_successful_items = 0
+                page_failed_items = 0
+                
+                for item in items:
+                    try:
+                        self._update_document(collection, item)
+                        page_successful_items += 1
+                    except pymongo.errors.PyMongoError as e:
+                        page_failed_items += 1
+                        logger.error(f"MongoDB error while updating item {item.get('id', 'unknown')} for {resource_name}: {str(e)}")
+                
+                # Update totals
+                total_successful_items += page_successful_items
+                total_failed_items += page_failed_items
+                
+                logger.info(f"Synced {page_successful_items} items for {resource_name} on page {current_page} (failed: {page_failed_items})")
+                
+                # Check if we need to continue to the next page
+                if len(items) == 0:
+                    has_more_pages = False
+                    logger.info(f"No more items for {resource_name}")
+                else:
+                    # Move to the next page
+                    current_page += 1
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"API request error for {resource_name} on page {current_page}: {str(e)}")
+                raise
+            except pymongo.errors.PyMongoError as e:
+                logger.error(f"MongoDB error for {resource_name} on page {current_page}: {str(e)}")
+                raise
+            except Exception as e:
+                logger.error(f"Error syncing {resource_name} on page {current_page}: {str(e)}")
+                raise
+        
+        # Log the total number of items synced
+        logger.info(f"Completed sync for {resource_name}: {total_successful_items} items synced successfully, {total_failed_items} failed")
+        
+        # Only update the last sync time if we had some successful updates
+        if total_successful_items > 0:
+            self._update_sync_metadata(resource_name)
     
     def _get_last_sync_time(self, resource_name: str) -> Optional[datetime.datetime]:
         """
@@ -465,6 +545,36 @@ class GalaxyAPISync:
                 ("user.id", pymongo.ASCENDING),
                 ("need.id", pymongo.ASCENDING),
             ],
+            # Indexes for aggregated collections
+            "user_activity_summary": [
+                ("_id", pymongo.ASCENDING),
+                ("total_hours", pymongo.DESCENDING),
+                ("shifts_attended", pymongo.DESCENDING),
+                ("last_activity", pymongo.DESCENDING),
+                ("days_since_last_activity", pymongo.ASCENDING),
+                ("user_info.user_email", pymongo.ASCENDING),
+                ("user_info.user_fname", pymongo.ASCENDING),
+                ("user_info.user_lname", pymongo.ASCENDING),
+            ],
+            "opportunity_activity": [
+                ("_id", pymongo.ASCENDING),
+                ("total_hours", pymongo.DESCENDING),
+                ("volunteer_count", pymongo.DESCENDING),
+                ("last_activity", pymongo.DESCENDING),
+                ("need_info.need_title", pymongo.TEXT),
+                ("agency_id", pymongo.ASCENDING),
+            ],
+            "agency_activity": [
+                ("_id", pymongo.ASCENDING),
+                ("total_hours", pymongo.DESCENDING),
+                ("volunteer_count", pymongo.DESCENDING),
+                ("opportunity_count", pymongo.DESCENDING),
+                ("agency_name", pymongo.ASCENDING),
+            ],
+            "monthly_activity": [
+                ("_id", pymongo.ASCENDING),  # Year-month
+                ("total_hours", pymongo.DESCENDING),
+            ],
         }
         
         # Create indexes for each collection with retries
@@ -516,6 +626,9 @@ class GalaxyAPISync:
                 # Sync all resources
                 self.sync_all_resources()
                 
+                # Generate aggregated reports
+                self.generate_activity_reports()
+                
                 # Log completion
                 elapsed = time.time() - start_time
                 logger.info(f"Completed sync in {elapsed:.2f} seconds")
@@ -530,15 +643,399 @@ class GalaxyAPISync:
                 logger.error(f"Error in sync loop: {str(e)}")
                 # Sleep a bit before retrying
                 time.sleep(60)
+                
+    def generate_activity_reports(self) -> None:
+        """
+        Generate aggregated reports on volunteer activity.
+        
+        This method creates various MongoDB aggregations to analyze volunteer activity,
+        including hours logged, shifts attended, and participation patterns.
+        """
+        logger.info("Generating activity reports...")
+        
+        try:
+            # 1. User Activity Summary - aggregate total hours, shifts, and last activity date per user
+            self._generate_user_activity_summary()
+            
+            # 2. Opportunity Activity - analyze hours and participation by opportunity
+            self._generate_opportunity_activity()
+            
+            # 3. Agency Activity - analyze volunteer engagement by agency
+            self._generate_agency_activity()
+            
+            # 4. Time-based Activity - analyze activity patterns over time
+            self._generate_time_based_activity()
+            
+            logger.info("Successfully generated all activity reports")
+            
+        except Exception as e:
+            logger.error(f"Error generating activity reports: {str(e)}")
+            raise
+    
+    def generate_specific_report(self, report_type: str) -> None:
+        """
+        Generate a specific activity report.
+        
+        Args:
+            report_type: Type of report to generate ('user', 'opportunity', 'agency', 'time')
+        """
+        logger.info(f"Generating specific report: {report_type}")
+        
+        try:
+            if report_type.lower() == 'user':
+                self._generate_user_activity_summary()
+            elif report_type.lower() == 'opportunity':
+                self._generate_opportunity_activity()
+            elif report_type.lower() == 'agency':
+                self._generate_agency_activity()
+            elif report_type.lower() == 'time':
+                self._generate_time_based_activity()
+            else:
+                logger.warning(f"Unknown report type: {report_type}")
+                raise ValueError(f"Unknown report type: {report_type}")
+                
+            logger.info(f"Successfully generated {report_type} report")
+            
+        except Exception as e:
+            logger.error(f"Error generating {report_type} report: {str(e)}")
+            raise
+    
+    def _generate_user_activity_summary(self) -> None:
+        """
+        Generate a summary of activity for each user.
+        
+        Creates a collection with user activity metrics including:
+        - Total hours logged
+        - Number of shifts attended
+        - List of opportunities participated in
+        - First and last activity dates
+        - Average hours per shift
+        """
+        logger.info("Generating user activity summary...")
+        
+        try:
+            # Define the aggregation pipeline
+            pipeline = [
+                # Match only approved hours
+                {"$match": {"hour_status": "Approved"}},
+                
+                # Group by user ID
+                {"$group": {
+                    "_id": "$user.id",
+                    "user_info": {"$first": "$user"},
+                    "total_hours": {"$sum": "$hour_duration"},
+                    "shifts_attended": {"$sum": 1},
+                    "opportunities": {"$addToSet": "$need.id"},
+                    "first_activity": {"$min": "$hour_date_start"},
+                    "last_activity": {"$max": "$hour_date_start"},
+                    "all_hours": {"$push": {
+                        "date": "$hour_date_start",
+                        "duration": "$hour_duration",
+                        "need_id": "$need.id",
+                        "need_title": "$need.title"
+                    }}
+                }},
+                
+                # Add calculated fields
+                {"$addFields": {
+                    "avg_hours_per_shift": {"$divide": ["$total_hours", "$shifts_attended"]},
+                    "days_since_last_activity": {
+                        "$divide": [
+                            {"$subtract": [datetime.datetime.utcnow(), "$last_activity"]},
+                            1000 * 60 * 60 * 24  # Convert ms to days
+                        ]
+                    },
+                    "opportunity_count": {"$size": "$opportunities"}
+                }},
+                
+                # Sort by total hours (descending)
+                {"$sort": {"total_hours": -1}},
+                
+                # Add metadata
+                {"$addFields": {
+                    "_synced_at": datetime.datetime.utcnow(),
+                    "_sync_source": "aggregation"
+                }}
+            ]
+            
+            # Run the aggregation and store results
+            result = self.db["hours"].aggregate(pipeline, allowDiskUse=True)
+            
+            # Clear the existing collection
+            self.db["user_activity_summary"].delete_many({})
+            
+            # Insert the aggregation results
+            if result:
+                self.db["user_activity_summary"].insert_many(list(result))
+                logger.info("User activity summary generated successfully")
+            else:
+                logger.warning("No data available for user activity summary")
+                
+        except Exception as e:
+            logger.error(f"Error generating user activity summary: {str(e)}")
+            raise
+    
+    def _generate_opportunity_activity(self) -> None:
+        """
+        Generate activity metrics for each opportunity.
+        
+        Creates a collection with opportunity metrics including:
+        - Total hours logged
+        - Number of unique volunteers
+        - Average hours per volunteer
+        - Most recent activity
+        """
+        logger.info("Generating opportunity activity metrics...")
+        
+        try:
+            # Define the aggregation pipeline
+            pipeline = [
+                # Match only approved hours
+                {"$match": {"hour_status": "Approved"}},
+                
+                # Group by opportunity (need) ID
+                {"$group": {
+                    "_id": "$need.id",
+                    "need_info": {"$first": "$need"},
+                    "agency_id": {"$first": "$need.agency_id"},
+                    "total_hours": {"$sum": "$hour_duration"},
+                    "volunteer_count": {"$addToSet": "$user.id"},
+                    "first_activity": {"$min": "$hour_date_start"},
+                    "last_activity": {"$max": "$hour_date_start"},
+                    "shifts_count": {"$sum": 1},
+                    "hours_by_month": {
+                        "$push": {
+                            "month": {"$substr": ["$hour_date_start", 0, 7]},  # YYYY-MM format
+                            "hours": "$hour_duration"
+                        }
+                    }
+                }},
+                
+                # Add calculated fields
+                {"$addFields": {
+                    "volunteer_count": {"$size": "$volunteer_count"},
+                    "avg_hours_per_volunteer": {"$divide": ["$total_hours", {"$size": "$volunteer_count"}]},
+                    "avg_shift_duration": {"$divide": ["$total_hours", "$shifts_count"]},
+                    "days_since_last_activity": {
+                        "$divide": [
+                            {"$subtract": [datetime.datetime.utcnow(), "$last_activity"]},
+                            1000 * 60 * 60 * 24  # Convert ms to days
+                        ]
+                    }
+                }},
+                
+                # Sort by total hours (descending)
+                {"$sort": {"total_hours": -1}},
+                
+                # Add metadata
+                {"$addFields": {
+                    "_synced_at": datetime.datetime.utcnow(),
+                    "_sync_source": "aggregation"
+                }}
+            ]
+            
+            # Run the aggregation and store results
+            result = self.db["hours"].aggregate(pipeline, allowDiskUse=True)
+            
+            # Clear the existing collection
+            self.db["opportunity_activity"].delete_many({})
+            
+            # Insert the aggregation results
+            if result:
+                self.db["opportunity_activity"].insert_many(list(result))
+                logger.info("Opportunity activity metrics generated successfully")
+            else:
+                logger.warning("No data available for opportunity activity metrics")
+                
+        except Exception as e:
+            logger.error(f"Error generating opportunity activity metrics: {str(e)}")
+            raise
+    
+    def _generate_agency_activity(self) -> None:
+        """
+        Generate activity metrics for each agency.
+        
+        Creates a collection with agency metrics including:
+        - Total volunteer hours
+        - Number of unique volunteers
+        - Number of opportunities
+        - Most active opportunities
+        """
+        logger.info("Generating agency activity metrics...")
+        
+        try:
+            # Define the aggregation pipeline
+            pipeline = [
+                # Match only approved hours
+                {"$match": {"hour_status": "Approved"}},
+                
+                # Lookup agency information
+                {"$lookup": {
+                    "from": "agencies",
+                    "localField": "need.agency_id",
+                    "foreignField": "id",
+                    "as": "agency"
+                }},
+                
+                # Unwind the agency array
+                {"$unwind": {"path": "$agency", "preserveNullAndEmptyArrays": True}},
+                
+                # Group by agency ID
+                {"$group": {
+                    "_id": "$agency.id",
+                    "agency_name": {"$first": "$agency.agency_name"},
+                    "agency_info": {"$first": "$agency"},
+                    "total_hours": {"$sum": "$hour_duration"},
+                    "volunteer_count": {"$addToSet": "$user.id"},
+                    "opportunity_count": {"$addToSet": "$need.id"},
+                    "first_activity": {"$min": "$hour_date_start"},
+                    "last_activity": {"$max": "$hour_date_start"},
+                    "opportunities": {
+                        "$push": {
+                            "need_id": "$need.id",
+                            "need_title": "$need.title",
+                            "hours": "$hour_duration"
+                        }
+                    }
+                }},
+                
+                # Add calculated fields
+                {"$addFields": {
+                    "volunteer_count": {"$size": "$volunteer_count"},
+                    "opportunity_count": {"$size": "$opportunity_count"},
+                    "avg_hours_per_volunteer": {"$divide": ["$total_hours", {"$size": "$volunteer_count"}]},
+                    "days_since_last_activity": {
+                        "$divide": [
+                            {"$subtract": [datetime.datetime.utcnow(), "$last_activity"]},
+                            1000 * 60 * 60 * 24  # Convert ms to days
+                        ]
+                    }
+                }},
+                
+                # Sort by total hours (descending)
+                {"$sort": {"total_hours": -1}},
+                
+                # Add metadata
+                {"$addFields": {
+                    "_synced_at": datetime.datetime.utcnow(),
+                    "_sync_source": "aggregation"
+                }}
+            ]
+            
+            # Run the aggregation and store results
+            result = self.db["hours"].aggregate(pipeline, allowDiskUse=True)
+            
+            # Clear the existing collection
+            self.db["agency_activity"].delete_many({})
+            
+            # Insert the aggregation results
+            if result:
+                self.db["agency_activity"].insert_many(list(result))
+                logger.info("Agency activity metrics generated successfully")
+            else:
+                logger.warning("No data available for agency activity metrics")
+                
+        except Exception as e:
+            logger.error(f"Error generating agency activity metrics: {str(e)}")
+            raise
+    
+    def _generate_time_based_activity(self) -> None:
+        """
+        Generate time-based activity reports.
+        
+        Creates collections with time-based metrics including:
+        - Monthly activity summary
+        - Day of week patterns
+        - Hour of day patterns
+        """
+        logger.info("Generating time-based activity reports...")
+        
+        try:
+            # 1. Monthly activity summary
+            monthly_pipeline = [
+                # Match only approved hours
+                {"$match": {"hour_status": "Approved"}},
+                
+                # Extract year and month from date
+                {"$addFields": {
+                    "year_month": {"$substr": ["$hour_date_start", 0, 7]}  # YYYY-MM format
+                }},
+                
+                # Group by year and month
+                {"$group": {
+                    "_id": "$year_month",
+                    "total_hours": {"$sum": "$hour_duration"},
+                    "volunteer_count": {"$addToSet": "$user.id"},
+                    "opportunity_count": {"$addToSet": "$need.id"},
+                    "agency_count": {"$addToSet": "$need.agency_id"},
+                    "shifts_count": {"$sum": 1}
+                }},
+                
+                # Add calculated fields
+                {"$addFields": {
+                    "volunteer_count": {"$size": "$volunteer_count"},
+                    "opportunity_count": {"$size": "$opportunity_count"},
+                    "agency_count": {"$size": "$agency_count"},
+                    "avg_hours_per_volunteer": {"$divide": ["$total_hours", {"$size": "$volunteer_count"}]},
+                    "avg_shift_duration": {"$divide": ["$total_hours", "$shifts_count"]}
+                }},
+                
+                # Sort by year and month
+                {"$sort": {"_id": 1}},
+                
+                # Add metadata
+                {"$addFields": {
+                    "_synced_at": datetime.datetime.utcnow(),
+                    "_sync_source": "aggregation"
+                }}
+            ]
+            
+            # Run the monthly aggregation and store results
+            monthly_result = self.db["hours"].aggregate(monthly_pipeline, allowDiskUse=True)
+            
+            # Clear the existing collection
+            self.db["monthly_activity"].delete_many({})
+            
+            # Insert the aggregation results
+            if monthly_result:
+                self.db["monthly_activity"].insert_many(list(monthly_result))
+                logger.info("Monthly activity report generated successfully")
+            else:
+                logger.warning("No data available for monthly activity report")
+            
+            # 2. Day of week activity patterns
+            # This would require date processing which is complex in MongoDB aggregation
+            # Consider implementing this in a separate method if needed
+            
+        except Exception as e:
+            logger.error(f"Error generating time-based activity reports: {str(e)}")
+            raise
 
 if __name__ == "__main__":
     # Create and run the sync tool
     try:
         sync_tool = GalaxyAPISync()
         
+        # Check if we should run a specific report
+        specific_report = os.getenv("GENERATE_SPECIFIC_REPORT", "")
+        if specific_report:
+            logger.info(f"Running specific report: {specific_report}")
+            sync_tool.generate_specific_report(specific_report)
+            sys.exit(0)
+        
+        # Check if we should run aggregations only
+        if os.getenv("GENERATE_REPORTS", "").lower() == "true":
+            logger.info("Running aggregations only")
+            sync_tool.generate_activity_reports()
+            sys.exit(0)
+        
         # Check if we should run a one-time sync
         if os.getenv("SYNC_ONCE", "").lower() == "true":
             sync_tool.sync_all_resources()
+            
+            # Generate reports after sync if requested
+            if os.getenv("INCLUDE_REPORTS", "").lower() == "true":
+                sync_tool.generate_activity_reports()
         else:
             # Run scheduled sync every hour by default, or as specified in config
             interval = int(os.getenv("SYNC_INTERVAL_MINUTES", "60"))

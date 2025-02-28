@@ -140,6 +140,82 @@ Each document includes:
 - `_synced_at` - When the document was last synced
 - `_sync_source` - Source of the sync (always "galaxy_api")
 
+## Aggregation Reports
+
+The sync tool includes powerful MongoDB aggregation pipelines that generate detailed activity reports. These reports provide valuable insights into volunteer activity, participation patterns, and impact metrics.
+
+### Available Reports
+
+The tool generates the following aggregated collections:
+
+- `user_activity_summary` - Comprehensive metrics for each volunteer:
+  - Total hours logged
+  - Number of shifts attended
+  - List of opportunities participated in
+  - First and last activity dates
+  - Average hours per shift
+  - Days since last activity
+
+- `opportunity_activity` - Metrics for each volunteer opportunity:
+  - Total hours logged
+  - Number of unique volunteers
+  - Average hours per volunteer
+  - First and last activity dates
+  - Monthly breakdown of hours
+
+- `agency_activity` - Metrics for each agency:
+  - Total volunteer hours
+  - Number of unique volunteers
+  - Number of opportunities
+  - Most active opportunities
+  - First and last activity dates
+
+- `monthly_activity` - Time-based activity patterns:
+  - Monthly totals of hours, volunteers, and opportunities
+  - Average hours per volunteer by month
+  - Trends over time
+
+### Running Aggregations
+
+You can generate these reports in several ways:
+
+1. **During scheduled sync**: Reports are automatically generated after each sync cycle
+   ```
+   # Set in .env file
+   INCLUDE_REPORTS=true
+   ```
+
+2. **Generate reports only** (without syncing data):
+   ```
+   GENERATE_REPORTS=true python galaxy-api-sync.py
+   ```
+
+3. **Generate a specific report**:
+   ```
+   GENERATE_SPECIFIC_REPORT=user python galaxy-api-sync.py
+   ```
+   
+   Available options: `user`, `opportunity`, `agency`, `time`
+
+### Using Aggregated Data
+
+The aggregated collections are optimized for analytics and reporting. You can query them directly from MongoDB or use the query tool:
+
+```bash
+# View top volunteers by hours
+python query_data.py --collection user_activity_summary --sort '{"total_hours": -1}' --limit 10
+
+# View most popular opportunities
+python query_data.py --collection opportunity_activity --sort '{"volunteer_count": -1}' --limit 5
+
+# View monthly trends
+python query_data.py --collection monthly_activity --sort '{"_id": 1}'
+```
+
+### Custom Aggregations
+
+You can extend the tool with your own custom aggregations by adding new methods to the `GalaxyAPISync` class. Follow the pattern of the existing aggregation methods.
+
 ## Troubleshooting
 
 ### Logs
