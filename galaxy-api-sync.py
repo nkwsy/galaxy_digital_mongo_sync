@@ -33,27 +33,105 @@ class GalaxyAPISync:
         """
         self.config = self._load_config(config_path)
         self.api_base_url = self.config.get("api_base_url", "https://api.galaxydigital.com/api")
+        
+        # Get credentials from environment variables
+        self.api_key = os.getenv("GALAXY_API_KEY")
         self.email = os.getenv("GALAXY_EMAIL")
         self.password = os.getenv("GALAXY_PASSWORD")
-        if not self.email or not self.password:
-            raise ValueError("Email and password not found in environment variables")
         
-        # Connect to MongoDB
-        self.client = MongoClient(self.config.get("mongodb_uri", "mongodb://localhost:27017/"))
-        self.db = self.client[self.config.get("mongodb_database", "galaxy_digital")]
+        if not self.email or not self.password or not self.api_key:
+            raise ValueError("API key, email, and password must be set in environment variables")
         
-        # Setup API headers
+        # Connect to MongoDB using environment variables
+        mongodb_uri = os.getenv("MONGODB_URI", self.config.get("mongodb_uri", "mongodb://localhost:27017/"))
+        mongodb_database = os.getenv("MONGODB_DATABASE", self.config.get("mongodb_database", "galaxy_digital"))
+        
+        logger.info(f"Connecting to MongoDB database: {mongodb_database}")
+        logger.info(f"Using connection string: {mongodb_uri.split('@')[0].split('://')[0]}://*****@{mongodb_uri.split('@')[1] if '@' in mongodb_uri else 'localhost'}")
+        
+        # Connect with proper authentication handling and retries
+        max_retries = 3
+        retry_delay = 2
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to MongoDB (attempt {attempt+1}/{max_retries})...")
+                
+                # Parse connection options from URI
+                connection_options = {
+                    "serverSelectionTimeoutMS": 5000,
+                    "connectTimeoutMS": 10000,
+                    "socketTimeoutMS": 45000,
+                    "retryWrites": True,
+                    "w": "majority"
+                }
+                
+                self.client = MongoClient(mongodb_uri, **connection_options)
+                
+                # Test the connection with a simple command
+                self.client.admin.command('ping')
+                
+                # Set the database
+                self.db = self.client[mongodb_database]
+                
+                # Test a simple operation on the database
+                self.db.list_collection_names()
+                
+                logger.info(f"Successfully connected to MongoDB database: {mongodb_database}")
+                break
+            except pymongo.errors.ConfigurationError as e:
+                last_error = e
+                logger.error(f"MongoDB configuration error: {str(e)}")
+                raise  # Configuration errors should not be retried
+            except pymongo.errors.OperationFailure as e:
+                last_error = e
+                if e.code == 18 or e.code == 8000:  # Authentication error codes
+                    logger.error(f"MongoDB authentication failed: {str(e)}")
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Retrying in {retry_delay} seconds... (attempt {attempt+1}/{max_retries})")
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error("Authentication failed after maximum retries. Please check your credentials.")
+                        raise
+                else:
+                    logger.error(f"MongoDB operation error: {str(e)}")
+                    raise
+            except pymongo.errors.ServerSelectionTimeoutError as e:
+                last_error = e
+                logger.warning(f"MongoDB server selection timeout (attempt {attempt+1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.warning(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to connect to MongoDB after {max_retries} attempts: {str(e)}")
+                    raise
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to connect to MongoDB (attempt {attempt+1}/{max_retries}): {str(e)}")
+                    logger.warning(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to connect to MongoDB after {max_retries} attempts: {str(e)}")
+                    raise
+        
+        # Initialize session and token
+        self.session = requests.Session()
+        self.token = None
+        self.login_response = None
+        self.debug = self.config.get("debug", False)
+        self.base_url = self.api_base_url  # Fix for _login method
+
+        # Login to get token
+        self._login()
+        
+        # Setup API headers after login
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-
-        self.session = requests.Session()
-        self.token = None
-        self.login_response = None
-
-        self._login()
         
         logger.info(f"Initialized Galaxy API Sync with base URL: {self.api_base_url}")
 
@@ -197,17 +275,37 @@ class GalaxyAPISync:
         # Use the API ID as a string for the MongoDB _id
         mongo_id = str(document[id_field])
         
-        # Try to update the document, insert if not exists
-        result = collection.update_one(
-            {id_field: document[id_field]},
-            {"$set": document},
-            upsert=True
-        )
+        # Try to update the document with retries
+        max_retries = 3
+        retry_delay = 2
         
-        if result.upserted_id:
-            logger.debug(f"Inserted new document with ID: {mongo_id}")
-        else:
-            logger.debug(f"Updated document with ID: {mongo_id}")
+        for attempt in range(max_retries):
+            try:
+                # Try to update the document, insert if not exists
+                result = collection.update_one(
+                    {id_field: document[id_field]},
+                    {"$set": document},
+                    upsert=True
+                )
+                
+                if result.upserted_id:
+                    logger.debug(f"Inserted new document with ID: {mongo_id}")
+                else:
+                    logger.debug(f"Updated document with ID: {mongo_id}")
+                    
+                # If successful, break the retry loop
+                break
+                
+            except pymongo.errors.AutoReconnect as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"MongoDB connection error, retrying in {retry_delay}s: {str(e)}")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to update document after {max_retries} attempts: {str(e)}")
+                    raise
+            except Exception as e:
+                logger.error(f"Error updating document: {str(e)}")
+                raise
     
     def _sync_resource(self, resource_name: str, params: Dict = None, since_field: str = None) -> None:
         """
@@ -219,7 +317,7 @@ class GalaxyAPISync:
             since_field: Field to use for incremental sync
         """
         logger.info(f"Syncing resource: {resource_name}")
-        collection = self.db[resource_name]
+        collection = self.db[f"{resource_name}"]
         
         # Prepare query parameters
         query_params = params or {}
@@ -243,15 +341,30 @@ class GalaxyAPISync:
                 logger.warning(f"No data found in response for {resource_name}")
                 return
             
-            # Process each item
+            # Process each item with MongoDB error handling
+            successful_items = 0
+            failed_items = 0
+            
             for item in response["data"]:
-                self._update_document(collection, item)
+                try:
+                    self._update_document(collection, item)
+                    successful_items += 1
+                except pymongo.errors.PyMongoError as e:
+                    failed_items += 1
+                    logger.error(f"MongoDB error while updating item {item.get('id', 'unknown')} for {resource_name}: {str(e)}")
             
-            logger.info(f"Synced {len(response['data'])} items for {resource_name}")
+            logger.info(f"Synced {successful_items} items for {resource_name} (failed: {failed_items})")
             
-            # Update the last sync time
-            self._update_sync_metadata(resource_name)
+            # Only update the last sync time if we had some successful updates
+            if successful_items > 0:
+                self._update_sync_metadata(resource_name)
             
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request error for {resource_name}: {str(e)}")
+            raise
+        except pymongo.errors.PyMongoError as e:
+            logger.error(f"MongoDB error for {resource_name}: {str(e)}")
+            raise
         except Exception as e:
             logger.error(f"Error syncing {resource_name}: {str(e)}")
             raise
@@ -354,18 +467,33 @@ class GalaxyAPISync:
             ],
         }
         
+        # Create indexes for each collection with retries
+        max_retries = 3
+        retry_delay = 2
+        
         # Create indexes for each collection
         for collection_name, collection_indexes in indexes.items():
             collection = self.db[collection_name]
             for field, direction in collection_indexes:
-                try:
-                    if direction == pymongo.TEXT:
-                        collection.create_index([(field, direction)])
-                    else:
-                        collection.create_index(field, direction)
-                    logger.info(f"Created index on {collection_name}.{field}")
-                except Exception as e:
-                    logger.error(f"Failed to create index on {collection_name}.{field}: {str(e)}")
+                for attempt in range(max_retries):
+                    try:
+                        if direction == pymongo.TEXT:
+                            # For text indexes, we need to use a list of tuples
+                            collection.create_index([(field, direction)])
+                        else:
+                            # For regular indexes, we need to use a list of tuples as well
+                            collection.create_index([(field, direction)])
+                        logger.info(f"Created index on {collection_name}.{field}")
+                        break  # Break the retry loop if successful
+                    except pymongo.errors.AutoReconnect as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"MongoDB connection error while creating index on {collection_name}.{field}, retrying in {retry_delay}s: {str(e)}")
+                            time.sleep(retry_delay)
+                        else:
+                            logger.error(f"Failed to create index on {collection_name}.{field} after {max_retries} attempts: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Failed to create index on {collection_name}.{field}: {str(e)}")
+                        break  # Break the retry loop for non-connection errors
     
     def run_scheduled_sync(self, interval_minutes: int = 60) -> None:
         """
