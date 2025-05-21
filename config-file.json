@@ -2,6 +2,8 @@
   "api_base_url": "https://api.galaxydigital.com/api",
   "mongodb_uri": "mongodb://localhost:27017/",
   "mongodb_database": "galaxy_digital",
+  "sync_interval_minutes": 60,
+  
   "resources": [
     {
       "name": "agencies",

@@ -111,16 +111,16 @@ The included query tool allows you to check the synced data:
 
 ```
 # Show sync status
-python query_data.py --status
+python query-tool.py --status
 
 # List available collections
-python query_data.py --list
+python query-tool.py --list
 
 # Query a specific collection
-python query_data.py --collection users --query '{"user_status": "active"}' --limit 5
+python query-tool.py --collection users --query '{"user_status": "active"}' --limit 5
 
 # Run predefined analysis
-python query_data.py --analyze needs
+python query-tool.py --analyze needs
 ```
 
 ## MongoDB Collections
@@ -170,6 +170,14 @@ The tool generates the following aggregated collections:
   - Most active opportunities
   - First and last activity dates
 
+- `shift_status` - Real-time tracking of shift participation and attendance:
+  - Who has signed up but not yet checked in (pending)
+  - Who is currently working a shift (active)
+  - Who has completed their shift (completed)
+  - Who didn't show up for their shift (absent)
+  - Who cancelled their participation (cancelled)
+  - Comprehensive details on each participant's status
+
 - `monthly_activity` - Time-based activity patterns:
   - Monthly totals of hours, volunteers, and opportunities
   - Average hours per volunteer by month
@@ -195,7 +203,7 @@ You can generate these reports in several ways:
    GENERATE_SPECIFIC_REPORT=user python galaxy-api-sync.py
    ```
    
-   Available options: `user`, `needs`, `opportunity`, `agency`, `time`
+   Available options: `user`, `needs`, `opportunity`, `agency`, `time`, `shift_status`
 
 ### Using Aggregated Data
 
@@ -203,13 +211,19 @@ The aggregated collections are optimized for analytics and reporting. You can qu
 
 ```bash
 # View top volunteers by hours
-python query_data.py --collection user_activity_summary --sort '{"total_hours": -1}' --limit 10
+python query-tool.py --collection user_activity_summary --sort '{"total_hours": -1}' --limit 10
 
 # View most popular opportunities
-python query_data.py --collection opportunity_activity --sort '{"volunteer_count": -1}' --limit 5
+python query-tool.py --collection opportunity_activity --sort '{"volunteer_count": -1}' --limit 5
 
 # View monthly trends
-python query_data.py --collection monthly_activity --sort '{"_id": 1}'
+python query-tool.py --collection monthly_activity --sort '{"_id": 1}'
+
+# View active volunteers currently working shifts
+python query-tool.py --collection shift_status --query '{"users.checkin_status": "active"}' --limit 5
+
+# Find volunteers who didn't show up for recent shifts
+python query-tool.py --collection shift_status --query '{"users.checkin_status": "absent", "start": {"$gte": "2023-05-01"}}' --limit 10
 ```
 
 ### Custom Aggregations
@@ -309,21 +323,21 @@ The query tool supports various analyses. Here are some examples:
 
 #### Volunteer Hours Summary
 ```bash
-python query_data.py --analyze hours
+python query-tool.py --analyze hours
 ```
 
 This provides monthly volunteer hour totals.
 
 #### User Activity Analysis
 ```bash
-python query_data.py --collection users --query '{"created_at": {"$gt": "2023-01-01"}}' --limit 10
+python query-tool.py --collection users --query '{"created_at": {"$gt": "2023-01-01"}}' --limit 10
 ```
 
 This shows users created since January 2023.
 
 #### Agency Need Analytics
 ```bash
-python query_data.py --analyze needs
+python query-tool.py --analyze needs
 ```
 
 This breaks down needs by status and shows the top agencies by need count.
