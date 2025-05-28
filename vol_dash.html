@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volunteer Checkout Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .loader {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .settings-panel {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: white;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <!-- Settings Panel for API Configuration -->
+    <div id="settingsPanel" class="settings-panel hidden">
+        <h3 class="font-semibold mb-2">API Settings</h3>
+        <label class="block text-sm text-gray-600 mb-1">API Endpoint:</label>
+        <input type="text" id="apiEndpoint" class="w-full px-2 py-1 border rounded text-sm mb-2" 
+               value="http://localhost:8000/users/pending-checkout?limit=100">
+        <button onclick="saveSettings()" class="px-3 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 mr-2">
+            Save
+        </button>
+        <button onclick="toggleSettings()" class="px-3 py-1 bg-gray-500 text-white text-sm rounded hover:bg-gray-600">
+            Cancel
+        </button>
+    </div>
+
+    <div id="app" class="min-h-screen bg-gray-50">
+        <!-- Header -->
+        <div class="border-b-2 border-slate-900 bg-slate-900 text-white p-5">
+            <div class="max-w-7xl mx-auto flex justify-between items-center">
+                <div>
+                    <h1 class="text-3xl font-semibold tracking-tight">Volunteer Checkout Management</h1>
+                    <p class="text-slate-300 text-sm mt-1">Pending checkouts tracker</p>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="toggleSettings()" class="flex items-center gap-2 px-4 py-2 rounded-lg font-medium bg-slate-700 hover:bg-slate-600 text-white transition-all">
+                        <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                        </svg>
+                        Settings
+                    </button>
+                    <button onclick="fetchData()" class="flex items-center gap-2 px-4 py-2 rounded-lg font-medium bg-slate-700 hover:bg-slate-600 text-white transition-all">
+                        <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- CORS Warning -->
+        <div id="corsWarning" class="hidden max-w-7xl mx-auto mt-4 px-6">
+            <div class="bg-yellow-50 border-2 border-yellow-400 rounded-lg p-4">
+                <div class="flex">
+                    <svg class="h-5 w-5 text-yellow-400 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                    </svg>
+                    <div class="ml-3">
+                        <h3 class="text-sm font-medium text-yellow-800">CORS Issue Detected</h3>
+                        <p class="mt-1 text-sm text-yellow-700">
+                            You're running this file directly from your filesystem. To fix this:
+                        </p>
+                        <ol class="mt-2 text-sm text-yellow-700 list-decimal list-inside">
+                            <li>Run a local web server: <code class="bg-yellow-100 px-1">python -m http.server 8080</code></li>
+                            <li>Or enable CORS on your API server</li>
+                            <li>Or use the Settings to configure a CORS-enabled endpoint</li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="max-w-7xl mx-auto p-6">
+            <!-- Stats Grid -->
+            <div id="stats" class="grid grid-cols-3 gap-4 mb-6">
+                <div class="bg-white border-2 border-orange-500 rounded-lg p-4 hover:shadow-lg transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="text-xs font-semibold uppercase tracking-wide text-orange-600 mb-1">Pending Checkouts</div>
+                            <div id="pendingCount" class="text-3xl font-bold text-orange-500">-</div>
+                        </div>
+                        <svg class="h-8 w-8 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                    </div>
+                </div>
+                <div class="bg-white border-2 border-blue-500 rounded-lg p-4 hover:shadow-lg transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="text-xs font-semibold uppercase tracking-wide text-blue-600 mb-1">Unique Volunteers</div>
+                            <div id="uniqueCount" class="text-3xl font-bold text-blue-500">-</div>
+                        </div>
+                        <svg class="h-8 w-8 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                        </svg>
+                    </div>
+                </div>
+                <div class="bg-white border-2 border-green-500 rounded-lg p-4 hover:shadow-lg transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="text-xs font-semibold uppercase tracking-wide text-green-600 mb-1">Active Shifts</div>
+                            <div id="shiftsCount" class="text-3xl font-bold text-green-500">-</div>
+                        </div>
+                        <svg class="h-8 w-8 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"></path>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Main Content -->
+            <div id="content" class="bg-white border-2 border-slate-300 rounded-lg overflow-hidden shadow-sm">
+                <!-- Loading State -->
+                <div id="loading" class="flex justify-center items-center h-32">
+                    <div class="loader"></div>
+                </div>
+
+                <!-- Table (hidden initially) -->
+                <table id="dataTable" class="w-full hidden">
+                    <thead>
+                        <tr class="border-b-2 border-slate-200 bg-slate-100">
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Volunteer</th>
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Shift</th>
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Check In</th>
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Expected Duration</th>
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Time Since Check In</th>
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Status</th>
+                            <th class="text-left p-3 font-semibold text-sm text-slate-700">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody">
+                        <!-- Data will be inserted here -->
+                    </tbody>
+                </table>
+
+                <!-- Error State (hidden initially) -->
+                <div id="error" class="hidden p-8 text-center">
+                    <svg class="h-12 w-12 text-red-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <h3 class="text-lg font-medium text-red-600 mb-2">Failed to load data</h3>
+                    <p id="errorMessage" class="text-gray-600 mb-4">Unable to connect to the server</p>
+                    <button onclick="fetchData()" class="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition-colors">
+                        Try Again
+                    </button>
+                </div>
+            </div>
+
+            <!-- Footer Info -->
+            <div class="mt-6 p-4 bg-slate-100 border-2 border-slate-300 rounded-lg">
+                <div class="flex items-center justify-between">
+                    <p class="text-sm font-medium text-slate-600">
+                        Last Updated: <span id="lastUpdate">-</span>
+                    </p>
+                    <p class="text-sm text-slate-500">
+                        Auto-refreshes every 30 seconds | API: <span id="currentEndpoint" class="font-mono text-xs"></span>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        let API_URL = localStorage.getItem('volunteerApiEndpoint') || 'http://localhost:8000/users/pending-checkout?limit=100';
+        let refreshInterval;
+
+        // Update displayed endpoint
+        document.getElementById('currentEndpoint').textContent = API_URL;
+        document.getElementById('apiEndpoint').value = API_URL;
+
+        // Settings functions
+        function toggleSettings() {
+            const panel = document.getElementById('settingsPanel');
+            panel.classList.toggle('hidden');
+        }
+
+        function saveSettings() {
+            const newEndpoint = document.getElementById('apiEndpoint').value;
+            API_URL = newEndpoint;
+            localStorage.setItem('volunteerApiEndpoint', newEndpoint);
+            document.getElementById('currentEndpoint').textContent = API_URL;
+            toggleSettings();
+            fetchData();
+        }
+
+        // Utility functions
+        function formatTime(dateString) {
+            const date = new Date(dateString);
+            return date.toLocaleTimeString('en-US', { 
+                hour: 'numeric', 
+                minute: '2-digit',
+                hour12: false 
+            });
+        }
+
+        function formatDate(dateString) {
+            const date = new Date(dateString);
+            return date.toLocaleDateString('en-US', { 
+                weekday: 'short',
+                month: 'short', 
+                day: 'numeric' 
+            });
+        }
+
+        function getTimeSince(startTime) {
+            const start = new Date(startTime);
+            const now = new Date();
+            const diff = now - start;
+            const hours = Math.floor(diff / (1000 * 60 * 60));
+            const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+            
+            if (hours > 0) {
+                return `${hours}h ${minutes}m ago`;
+            } else {
+                return `${minutes}m ago`;
+            }
+        }
+
+        async function checkoutVolunteer(hourId, volunteerName) {
+            if (confirm(`Check out ${volunteerName}?`)) {
+                alert('Checkout functionality would be implemented here for hour ID: ' + hourId);
+                // In a real implementation, you would make an API call here
+                // await fetch(`/api/checkout/${hourId}`, { method: 'POST' });
+                // fetchData(); // Refresh the data
+            }
+        }
+
+        async function fetchData() {
+            const loading = document.getElementById('loading');
+            const table = document.getElementById('dataTable');
+            const error = document.getElementById('error');
+            const tableBody = document.getElementById('tableBody');
+            const corsWarning = document.getElementById('corsWarning');
+            
+            // Show loading state
+            loading.classList.remove('hidden');
+            table.classList.add('hidden');
+            error.classList.add('hidden');
+            corsWarning.classList.add('hidden');
+            
+            try {
+                const response = await fetch(API_URL);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                const volunteers = result.data || [];
+                
+                // Update stats
+                document.getElementById('pendingCount').textContent = result.count || volunteers.length;
+                
+                // Count unique volunteers
+                const uniqueVolunteers = new Set(volunteers.map(v => v.user.id));
+                document.getElementById('uniqueCount').textContent = uniqueVolunteers.size;
+                
+                // Count unique shifts
+                const uniqueShifts = new Set(volunteers.map(v => v.shift_id));
+                document.getElementById('shiftsCount').textContent = uniqueShifts.size;
+                
+                // Clear table body
+                tableBody.innerHTML = '';
+                
+                // Populate table
+                if (volunteers.length === 0) {
+                    tableBody.innerHTML = `
+                        <tr>
+                            <td colspan="7" class="text-center p-8 text-slate-500">
+                                No pending checkouts found
+                            </td>
+                        </tr>
+                    `;
+                } else {
+                    volunteers.forEach(volunteer => {
+                        const row = document.createElement('tr');
+                        row.className = 'border-b border-slate-200 hover:bg-slate-50 transition-colors bg-orange-50';
+                        
+                        row.innerHTML = `
+                            <td class="p-3">
+                                <div class="font-medium text-slate-900">
+                                    ${volunteer.user.user_fname} ${volunteer.user.user_lname}
+                                </div>
+                                <div class="text-sm text-slate-500">${volunteer.user.user_email}</div>
+                            </td>
+                            <td class="p-3">
+                                <div class="font-medium text-slate-900">${volunteer.shift_title}</div>
+                                <div class="text-sm text-slate-500">
+                                    ${formatTime(volunteer.shift_start)} - ${formatTime(volunteer.shift_end)}
+                                </div>
+                            </td>
+                            <td class="p-3">
+                                <div class="font-mono text-sm text-slate-600">
+                                    ${formatDate(volunteer.user.hour_date_start)}
+                                </div>
+                                <div class="font-mono text-sm text-slate-600">
+                                    ${formatTime(volunteer.user.hour_date_start)}
+                                </div>
+                            </td>
+                            <td class="p-3">
+                                <span class="font-medium text-slate-900">
+                                    ${volunteer.user.duration || volunteer.user.hour_duration}h
+                                </span>
+                            </td>
+                            <td class="p-3">
+                                <span class="inline-flex items-center gap-1.5 text-orange-700 font-medium">
+                                    <svg class="h-4 w-4 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    ${getTimeSince(volunteer.user.hour_date_start)}
+                                </span>
+                            </td>
+                            <td class="p-3">
+                                <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-orange-100 text-orange-700 text-sm font-medium">
+                                    <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    Pending Checkout
+                                </span>
+                            </td>
+                            <td class="p-3">
+                                <button onclick="checkoutVolunteer(${volunteer.user.hour_id}, '${volunteer.user.user_fname} ${volunteer.user.user_lname}')" 
+                                        class="px-3 py-1 bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium rounded transition-colors">
+                                    Check Out
+                                </button>
+                            </td>
+                        `;
+                        
+                        tableBody.appendChild(row);
+                    });
+                }
+                
+                // Update last update time
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('en-US', { 
+                    hour: 'numeric', 
+                    minute: '2-digit', 
+                    second: '2-digit',
+                    hour12: false 
+                });
+                
+                // Show table
+                loading.classList.add('hidden');
+                table.classList.remove('hidden');
+                
+            } catch (err) {
+                console.error('Error fetching data:', err);
+                
+                // Check if it's a CORS error
+                if (err.message.includes('Failed to fetch') && window.location.protocol === 'file:') {
+                    corsWarning.classList.remove('hidden');
+                }
+                
+                document.getElementById('errorMessage').textContent = err.message || 'Unable to connect to the server';
+                loading.classList.add('hidden');
+                error.classList.remove('hidden');
+            }
+        }
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            fetchData();
+            
+            // Set up auto-refresh every 30 seconds
+            refreshInterval = setInterval(fetchData, 30000);
+        });
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', function() {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        });
+    </script>
+</body>
+</html>
