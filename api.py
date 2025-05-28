@@ -224,7 +224,7 @@ async def get_checkin_status(
     try:
         # Sync the 'hours' resource and regenerate aggregations before querying
         sync_tool._sync_resource('hours', since_field='since_updated')
-        sync_tool._generate_shift_status()
+        sync_tool._generate_shift_status(future_only=True)
         sync_tool._generate_checkin_checkout_analysis()
 
         filter_query = {}
@@ -319,6 +319,8 @@ async def get_today_shifts(
 async def get_users_pending_checkout(limit: int = Query(100, le=1000)):
     """Get all users who have checked in but not checked out"""
     try:
+        sync_tool._sync_resource('hours', since_field='since_updated')
+        sync_tool._generate_checkin_checkout_analysis()
         collection = sync_tool.db["shift_status"]
         
         # Find shifts with users who have checked in but not out
