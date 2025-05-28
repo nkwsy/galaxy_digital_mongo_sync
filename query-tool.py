@@ -7,6 +7,7 @@ to MongoDB.
 import sys
 import argparse
 import json
+import csv
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 from pymongo import MongoClient
@@ -970,6 +971,98 @@ def simple_fix_need(db, need_id=800197):
     except Exception as e:
         print(f"Error in simple_fix_need: {str(e)}")
 
+def export_shift_status_csv(db, start_date=None, end_date=None, need_id=None, output_file="shift_status_export.csv"):
+    """Export shift status data with user details to CSV with optional date and need_id filters"""
+    print(f"Exporting shift status data to {output_file}")
+    
+    # Build the query
+    query = {}
+    
+    # Add date filters if provided
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            query["start"] = {"$gte": start_dt}
+            print(f"Filtering shifts starting on or after {start_date}")
+        except ValueError:
+            print(f"Invalid start date format. Please use YYYY-MM-DD format.")
+            return False
+    
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            # Make it inclusive by setting to end of day
+            end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            
+            # Add to existing query if start_date was also provided
+            if "start" in query:
+                query["start"]["$lte"] = end_dt
+            else:
+                query["start"] = {"$lte": end_dt}
+                
+            print(f"Filtering shifts starting on or before {end_date}")
+        except ValueError:
+            print(f"Invalid end date format. Please use YYYY-MM-DD format.")
+            return False
+    
+    # Add need_id filter if provided
+    if need_id:
+        query["need_id"] = need_id
+        print(f"Filtering by need ID: {need_id}")
+    
+    # Get the shifts matching our query
+    shifts = list(db["shift_status"].find(query))
+    print(f"Found {len(shifts)} shifts matching criteria")
+    
+    if not shifts:
+        print("No data found matching the criteria")
+        return False
+    
+    # Set up CSV writer
+    with open(output_file, 'w', newline='', encoding='utf-8') as csv_file:
+        fieldnames = [
+            'shift_start', 'shift_end', 'need_id', 'title', 
+            'slots', 'slots_filled', 'user_fname', 'user_lname', 
+            'hour_status', 'checkin_status', 'user_id'
+        ]
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        # Process each shift and its users
+        row_count = 0
+        for shift in shifts:
+            # Get base shift data
+            base_data = {
+                'shift_start': format_datetime(shift.get('start')),
+                'shift_end': format_datetime(shift.get('end')),
+                'need_id': shift.get('need_id'),
+                'title': shift.get('title'),
+                'slots': shift.get('slots'),
+                'slots_filled': shift.get('slots_filled')
+            }
+            
+            # Process each user in the shift
+            users = shift.get('users', [])
+            if not users:
+                # Write one row with shift data but no user data
+                writer.writerow(base_data)
+                row_count += 1
+            else:
+                for user in users:
+                    row = base_data.copy()
+                    row.update({
+                        'user_fname': user.get('user_fname'),
+                        'user_lname': user.get('user_lname'),
+                        'hour_status': user.get('hour_status'),
+                        'checkin_status': user.get('checkin_status'),
+                        'user_id': user.get('id')
+                    })
+                    writer.writerow(row)
+                    row_count += 1
+    
+    print(f"Successfully exported {row_count} rows to {output_file}")
+    return True
+
 def main():
     parser = argparse.ArgumentParser(description="Query Galaxy Digital data synced to MongoDB")
     parser.add_argument("--status", action="store_true", help="Show sync status")
@@ -987,6 +1080,11 @@ def main():
     parser.add_argument("--fix-status", action="store_true", help="Fix checkin status for users with approved hours")
     parser.add_argument("--fix-need", type=int, help="Fix checkin status for a specific need ID")
     parser.add_argument("--simple-fix", type=int, help="Simple fix for a specific need ID")
+    parser.add_argument("--export-csv", action="store_true", help="Export shift status data to CSV")
+    parser.add_argument("--start-date", help="Filter shifts starting on or after this date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", help="Filter shifts starting on or before this date (YYYY-MM-DD)")
+    parser.add_argument("--csv-need-id", type=int, help="Filter shifts by need_id for CSV export")
+    parser.add_argument("--output", help="Output file name for CSV export (default: shift_status_export.csv)")
     
     args = parser.parse_args()
     
@@ -1012,6 +1110,9 @@ def main():
         fix_specific_need(db, args.fix_need)
     elif args.simple_fix:
         simple_fix_need(db, args.simple_fix)
+    elif args.export_csv:
+        output_file = args.output if args.output else "shift_status_export.csv"
+        export_shift_status_csv(db, args.start_date, args.end_date, args.csv_need_id, output_file)
     else:
         parser.print_help()
 
