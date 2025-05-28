@@ -421,4 +421,21 @@ async def serve_vol_dash():
 # Run the app
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    import os
+    import sys
+    
+    # Allow port to be set via environment variable or command-line argument
+    port = 8000
+    # Check environment variable first
+    if os.getenv("PORT"):
+        try:
+            port = int(os.getenv("PORT"))
+        except ValueError:
+            pass
+    # Check command-line argument (e.g., python api.py 8080)
+    if len(sys.argv) > 1:
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            pass
+    uvicorn.run(app, host="0.0.0.0", port=port) 
