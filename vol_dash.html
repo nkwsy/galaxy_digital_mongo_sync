@@ -40,7 +40,7 @@
         <h3 class="font-semibold mb-2">API Settings</h3>
         <label class="block text-sm text-gray-600 mb-1">API Endpoint:</label>
         <input type="text" id="apiEndpoint" class="w-full px-2 py-1 border rounded text-sm mb-2" 
-               value="http://localhost:8000/users/pending-checkout?limit=100">
+               value="http://127.0.0.1:8000/users/pending-checkout?limit=100">
         <button onclick="saveSettings()" class="px-3 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 mr-2">
             Save
         </button>
@@ -65,11 +65,11 @@
                         </svg>
                         Settings
                     </button>
-                    <button onclick="fetchData()" class="flex items-center gap-2 px-4 py-2 rounded-lg font-medium bg-slate-700 hover:bg-slate-600 text-white transition-all">
+                    <button onclick="triggerSyncAndRefresh()" class="flex items-center gap-2 px-4 py-2 rounded-lg font-medium bg-slate-700 hover:bg-slate-600 text-white transition-all">
                         <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
                         </svg>
-                        Refresh
+                        <span id="refreshButtonText">Refresh</span>
                     </button>
                 </div>
             </div>
@@ -83,15 +83,19 @@
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
                     </svg>
                     <div class="ml-3">
-                        <h3 class="text-sm font-medium text-yellow-800">CORS Issue Detected</h3>
+                        <h3 class="text-sm font-medium text-yellow-800">API Connection Issue</h3>
                         <p class="mt-1 text-sm text-yellow-700">
-                            You're running this file directly from your filesystem. To fix this:
+                            Unable to connect to the API. The system tried multiple endpoints but couldn't establish a connection.
                         </p>
                         <ol class="mt-2 text-sm text-yellow-700 list-decimal list-inside">
-                            <li>Run a local web server: <code class="bg-yellow-100 px-1">python -m http.server 8080</code></li>
-                            <li>Or enable CORS on your API server</li>
-                            <li>Or use the Settings to configure a CORS-enabled endpoint</li>
+                            <li>Ensure the Galaxy Digital API is running on the same server or network</li>
+                            <li>Check if the API is running on port 8000 or another port</li>
+                            <li>Use the Settings button to manually configure the API endpoint</li>
+                            <li>If running locally: <code class="bg-yellow-100 px-1">python api.py</code></li>
                         </ol>
+                        <p class="mt-2 text-sm text-yellow-700">
+                            Attempted endpoints: <span id="attemptedEndpoints" class="font-mono text-xs"></span>
+                        </p>
                     </div>
                 </div>
             </div>
@@ -173,6 +177,30 @@
                 </div>
             </div>
 
+            <!-- Today's Shifts Section -->
+            <div id="todayShifts" class="mt-6">
+                <h2 class="text-2xl font-semibold text-slate-900 mb-4">Today's Shifts</h2>
+                
+                <!-- Loading State -->
+                <div id="shiftsLoading" class="flex justify-center items-center h-32 bg-white border-2 border-slate-300 rounded-lg">
+                    <div class="loader"></div>
+                </div>
+
+                <!-- Shifts Grid (hidden initially) -->
+                <div id="shiftsGrid" class="hidden grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <!-- Shift cards will be inserted here -->
+                </div>
+
+                <!-- Error State (hidden initially) -->
+                <div id="shiftsError" class="hidden bg-white border-2 border-red-300 rounded-lg p-8 text-center">
+                    <svg class="h-12 w-12 text-red-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <h3 class="text-lg font-medium text-red-600 mb-2">Failed to load today's shifts</h3>
+                    <p id="shiftsErrorMessage" class="text-gray-600 mb-4">Unable to connect to the server</p>
+                </div>
+            </div>
+
             <!-- Footer Info -->
             <div class="mt-6 p-4 bg-slate-100 border-2 border-slate-300 rounded-lg">
                 <div class="flex items-center justify-between">
@@ -180,7 +208,7 @@
                         Last Updated: <span id="lastUpdate">-</span>
                     </p>
                     <p class="text-sm text-slate-500">
-                        Auto-refreshes every 30 seconds | API: <span id="currentEndpoint" class="font-mono text-xs"></span>
+                        Auto-refreshes every 30 seconds | Refresh button triggers full data sync | API: <span id="currentEndpoint" class="font-mono text-xs"></span>
                     </p>
                 </div>
             </div>
@@ -188,13 +216,113 @@
     </div>
 
     <script>
+        // Smart API URL detection
+        function getDefaultApiUrl() {
+            // If we have a stored preference, use that first
+            const stored = localStorage.getItem('volunteerApiEndpoint');
+            if (stored) {
+                return stored;
+            }
+            
+            // Get current location info
+            const protocol = window.location.protocol;
+            const hostname = window.location.hostname;
+            const port = window.location.port;
+            
+            // If served from file:// protocol, use localhost
+            if (protocol === 'file:') {
+                return 'http://127.0.0.1:8000/users/pending-checkout?limit=100';
+            }
+            
+            // Check if we're likely on the same server as the API
+            // Common API ports
+            const apiPorts = ['8000', '8080', '3000', '5000'];
+            
+            // If we're already on one of the common API ports, use relative URL
+            if (apiPorts.includes(port)) {
+                return '/users/pending-checkout?limit=100';
+            }
+            
+            // Try to detect if API is running on same host but different port
+            // First check port 8000 (most common for FastAPI)
+            const baseUrl = `${protocol}//${hostname}:8000`;
+            
+            // For production environments, might be on same port
+            if (!port || port === '80' || port === '443') {
+                // Try relative URL first for production deployments
+                return '/users/pending-checkout?limit=100';
+            }
+            
+            // Default to same host on port 8000
+            return `${baseUrl}/users/pending-checkout?limit=100`;
+        }
+        
         // Configuration
-        let API_URL = localStorage.getItem('volunteerApiEndpoint') || 'http://localhost:8000/users/pending-checkout?limit=100';
+        let API_URL = getDefaultApiUrl();
         let refreshInterval;
 
         // Update displayed endpoint
         document.getElementById('currentEndpoint').textContent = API_URL;
         document.getElementById('apiEndpoint').value = API_URL;
+        
+        // Test API connectivity and auto-adjust if needed
+        async function testAndAdjustApiUrl() {
+            const urlsToTry = [
+                API_URL,
+                '/users/pending-checkout?limit=100', // Relative URL
+                `${window.location.protocol}//${window.location.hostname}:8000/users/pending-checkout?limit=100`,
+                `${window.location.protocol}//${window.location.hostname}:${window.location.port}/users/pending-checkout?limit=100`,
+                'http://127.0.0.1:8000/users/pending-checkout?limit=100',
+                'http://localhost:8000/users/pending-checkout?limit=100'
+            ];
+            
+            // Remove duplicates
+            const uniqueUrls = [...new Set(urlsToTry)];
+            const attemptedUrls = [];
+            
+            for (const url of uniqueUrls) {
+                attemptedUrls.push(url);
+                try {
+                    // Create timeout promise for browsers that don't support AbortSignal.timeout
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 3000);
+                    
+                    const response = await fetch(url, {
+                        method: 'GET',
+                        mode: 'cors',
+                        cache: 'no-cache',
+                        signal: controller.signal
+                    });
+                    
+                    clearTimeout(timeoutId);
+                    
+                    if (response.ok || response.status === 404) { // 404 might mean no data, but API is responding
+                        // Found working URL
+                        if (url !== API_URL) {
+                            console.log(`Auto-detected working API URL: ${url}`);
+                            API_URL = url;
+                            document.getElementById('currentEndpoint').textContent = API_URL;
+                            document.getElementById('apiEndpoint').value = API_URL;
+                            
+                            // Don't save auto-detected URLs to avoid overriding user preferences
+                            // Only save if user explicitly uses the settings panel
+                        }
+                        return true;
+                    }
+                } catch (e) {
+                    // Try next URL
+                    console.debug(`Failed to connect to ${url}: ${e.message}`);
+                }
+            }
+            
+            // If we get here, no URLs worked - show what we tried
+            const attemptedElement = document.getElementById('attemptedEndpoints');
+            if (attemptedElement) {
+                attemptedElement.textContent = attemptedUrls.join(', ');
+            }
+            
+            return false;
+        }
 
         // Settings functions
         function toggleSettings() {
@@ -250,6 +378,194 @@
                 // In a real implementation, you would make an API call here
                 // await fetch(`/api/checkout/${hourId}`, { method: 'POST' });
                 // fetchData(); // Refresh the data
+            }
+        }
+
+        async function fetchTodayShifts() {
+            const loading = document.getElementById('shiftsLoading');
+            const grid = document.getElementById('shiftsGrid');
+            const error = document.getElementById('shiftsError');
+            
+            // Show loading state
+            loading.classList.remove('hidden');
+            grid.classList.add('hidden');
+            error.classList.add('hidden');
+            
+            try {
+                // Build the shifts/today URL
+                let shiftsUrl;
+                if (API_URL.startsWith('/')) {
+                    // Relative URL - extract base path
+                    const basePath = API_URL.split('/users')[0];
+                    shiftsUrl = `${basePath}/shifts/today`;
+                } else {
+                    // Absolute URL - extract base URL
+                    const baseUrl = API_URL.split('/users')[0];
+                    shiftsUrl = `${baseUrl}/shifts/today`;
+                }
+                
+                const response = await fetch(shiftsUrl);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                const shifts = result.data || [];
+                
+                // Clear grid
+                grid.innerHTML = '';
+                
+                if (shifts.length === 0) {
+                    grid.innerHTML = `
+                        <div class="col-span-full text-center p-8 bg-gray-50 rounded-lg">
+                            <svg class="h-12 w-12 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                            </svg>
+                            <p class="text-gray-500">No shifts scheduled for today</p>
+                        </div>
+                    `;
+                } else {
+                    // Render shift cards
+                    shifts.forEach(shift => {
+                        const card = createShiftCard(shift);
+                        grid.innerHTML += card;
+                    });
+                }
+                
+                // Show grid
+                loading.classList.add('hidden');
+                grid.classList.remove('hidden');
+                
+            } catch (err) {
+                console.error('Error fetching today\'s shifts:', err);
+                document.getElementById('shiftsErrorMessage').textContent = err.message || 'Unable to connect to the server';
+                loading.classList.add('hidden');
+                error.classList.remove('hidden');
+            }
+        }
+
+        function createShiftCard(shift) {
+            const startTime = formatTime(shift.start);
+            const endTime = formatTime(shift.end);
+            
+            // Count users by status
+            const statusCounts = {
+                pending: 0,
+                completed: 0,
+                cancelled: 0,
+                active: 0,
+                absent: 0
+            };
+            
+            shift.users.forEach(user => {
+                const status = user.checkin_status || 'pending';
+                if (statusCounts.hasOwnProperty(status)) {
+                    statusCounts[status]++;
+                } else {
+                    statusCounts.absent++;
+                }
+            });
+            
+            // Create user list HTML
+            let usersHtml = '';
+            shift.users.forEach(user => {
+                const status = user.checkin_status || 'pending';
+                const statusBadge = getStatusBadge(status, user.checkout_status);
+                
+                usersHtml += `
+                    <div class="p-2 border-b border-gray-100 last:border-0">
+                        <div class="flex justify-between items-start">
+                            <div class="flex-1">
+                                <div class="font-medium text-sm text-gray-900">
+                                    ${user.user_fname} ${user.user_lname}
+                                </div>
+                                <div class="text-xs text-gray-500">${user.user_email}</div>
+                            </div>
+                            <div class="ml-2">
+                                ${statusBadge}
+                            </div>
+                        </div>
+                        ${user.hour_id ? `
+                            <div class="mt-1 text-xs text-gray-600">
+                                ${user.has_checkin ? '✓ Checked in' : ''} 
+                                ${user.has_checkout ? '✓ Checked out' : ''}
+                                ${user.hour_duration ? `(${user.hour_duration}h)` : ''}
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            });
+            
+            // Calculate fill percentage
+            const fillPercentage = shift.slots > 0 ? Math.round((shift.slots_filled / shift.slots) * 100) : 0;
+            
+            return `
+                <div class="bg-white border-2 border-gray-200 rounded-lg overflow-hidden hover:shadow-lg transition-shadow">
+                    <div class="p-4 bg-gradient-to-r from-blue-50 to-indigo-50">
+                        <h3 class="font-semibold text-gray-900 text-sm mb-1">${shift.title}</h3>
+                        <div class="flex items-center text-gray-600 text-sm">
+                            <svg class="h-4 w-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            ${startTime} - ${endTime} (${shift.duration}h)
+                        </div>
+                    </div>
+                    
+                    <div class="p-4">
+                        <!-- Slots and Status Summary -->
+                        <div class="mb-3">
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-sm text-gray-600">Capacity</span>
+                                <span class="text-sm font-medium">${shift.slots_filled}/${shift.slots} slots</span>
+                            </div>
+                            <div class="w-full bg-gray-200 rounded-full h-2">
+                                <div class="bg-blue-500 h-2 rounded-full" style="width: ${fillPercentage}%"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Status Summary -->
+                        <div class="grid grid-cols-2 gap-2 mb-3 text-xs">
+                            ${statusCounts.pending > 0 ? `<div class="flex items-center"><span class="w-2 h-2 bg-yellow-400 rounded-full mr-1"></span> ${statusCounts.pending} pending</div>` : ''}
+                            ${statusCounts.completed > 0 ? `<div class="flex items-center"><span class="w-2 h-2 bg-green-400 rounded-full mr-1"></span> ${statusCounts.completed} completed</div>` : ''}
+                            ${statusCounts.active > 0 ? `<div class="flex items-center"><span class="w-2 h-2 bg-blue-400 rounded-full mr-1"></span> ${statusCounts.active} active</div>` : ''}
+                            ${statusCounts.cancelled > 0 ? `<div class="flex items-center"><span class="w-2 h-2 bg-gray-400 rounded-full mr-1"></span> ${statusCounts.cancelled} cancelled</div>` : ''}
+                        </div>
+                        
+                        <!-- Expandable User List -->
+                        <details class="group">
+                            <summary class="cursor-pointer font-medium text-sm text-gray-700 hover:text-gray-900 flex items-center">
+                                <svg class="h-4 w-4 mr-1 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                                </svg>
+                                View Volunteers (${shift.users.length})
+                            </summary>
+                            <div class="mt-2 max-h-64 overflow-y-auto border rounded-lg">
+                                ${usersHtml}
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getStatusBadge(checkinStatus, checkoutStatus) {
+            if (checkinStatus === 'completed') {
+                return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">Completed</span>`;
+            } else if (checkinStatus === 'active') {
+                if (checkoutStatus === 'checked_in_only') {
+                    return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-700">Checked In</span>`;
+                } else if (checkoutStatus === 'checked_in_and_out') {
+                    return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">Pending Approval</span>`;
+                } else {
+                    return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">Active</span>`;
+                }
+            } else if (checkinStatus === 'cancelled') {
+                return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">Cancelled</span>`;
+            } else if (checkinStatus === 'absent') {
+                return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-700">Absent</span>`;
+            } else {
+                return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700">Pending</span>`;
             }
         }
 
@@ -384,11 +700,25 @@
         }
 
         // Initialize on page load
-        document.addEventListener('DOMContentLoaded', function() {
-            fetchData();
+        document.addEventListener('DOMContentLoaded', async function() {
+            // Test API connectivity first
+            const apiWorking = await testAndAdjustApiUrl();
             
-            // Set up auto-refresh every 30 seconds
-            refreshInterval = setInterval(fetchData, 30000);
+            if (!apiWorking) {
+                // Show warning if no API connection
+                document.getElementById('corsWarning').classList.remove('hidden');
+            }
+            
+            // Fetch data regardless (will show proper error states)
+            fetchData();
+            fetchTodayShifts();
+            
+            // Set up auto-refresh every 30 seconds (without sync)
+            refreshInterval = setInterval(() => {
+                // Auto-refresh only fetches data, doesn't trigger sync
+                fetchData();
+                fetchTodayShifts();
+            }, 30000);
         });
 
         // Clean up on page unload
@@ -397,6 +727,94 @@
                 clearInterval(refreshInterval);
             }
         });
+
+        // New function to trigger sync and refresh
+        async function triggerSyncAndRefresh() {
+            const refreshButton = document.querySelector('button[onclick="triggerSyncAndRefresh()"]');
+            const refreshButtonText = document.getElementById('refreshButtonText');
+            
+            try {
+                // Disable button and show syncing status
+                refreshButton.disabled = true;
+                refreshButton.classList.add('opacity-50', 'cursor-not-allowed');
+                refreshButtonText.textContent = 'Syncing...';
+                
+                // Trigger the sync/all endpoint
+                let syncUrl;
+                if (API_URL.startsWith('/')) {
+                    // Relative URL - extract base path
+                    const basePath = API_URL.split('/users')[0];
+                    syncUrl = `${basePath}/sync/all`;
+                } else {
+                    // Absolute URL - extract base URL
+                    const baseUrl = API_URL.split('/users')[0];
+                    syncUrl = `${baseUrl}/sync/all`;
+                }
+                
+                try {
+                    const syncResponse = await fetch(syncUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    if (syncResponse.ok) {
+                        const syncResult = await syncResponse.json();
+                        console.log('Sync started:', syncResult);
+                        
+                        // Show sync started message
+                        refreshButtonText.textContent = 'Sync Started...';
+                        
+                        // Wait a bit for sync to process (sync runs in background)
+                        // This gives the sync some time to update data before we fetch
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    } else {
+                        console.error('Sync failed:', syncResponse.status);
+                    }
+                } catch (syncError) {
+                    console.error('Error triggering sync:', syncError);
+                    // Continue with refresh even if sync fails
+                }
+                
+                // Update button text to show fetching
+                refreshButtonText.textContent = 'Fetching...';
+                
+                // Fetch updated data
+                await fetchData();
+                await fetchTodayShifts();
+                
+                // Success - briefly show done message
+                refreshButtonText.textContent = 'Done!';
+                refreshButton.classList.remove('bg-slate-700');
+                refreshButton.classList.add('bg-green-600');
+                
+                setTimeout(() => {
+                    refreshButtonText.textContent = 'Refresh';
+                    refreshButton.classList.remove('bg-green-600');
+                    refreshButton.classList.add('bg-slate-700');
+                }, 1500);
+                
+            } catch (error) {
+                console.error('Error during sync and refresh:', error);
+                
+                // Show error state
+                refreshButtonText.textContent = 'Error!';
+                refreshButton.classList.remove('bg-slate-700');
+                refreshButton.classList.add('bg-red-600');
+                
+                setTimeout(() => {
+                    refreshButtonText.textContent = 'Refresh';
+                    refreshButton.classList.remove('bg-red-600');
+                    refreshButton.classList.add('bg-slate-700');
+                }, 2000);
+                
+            } finally {
+                // Re-enable button
+                refreshButton.disabled = false;
+                refreshButton.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        }
     </script>
 </body>
 </html>
