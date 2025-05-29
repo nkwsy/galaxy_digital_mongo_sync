@@ -65,11 +65,11 @@
                         </svg>
                         Settings
                     </button>
-                    <button onclick="fetchData(); fetchTodayShifts();" class="flex items-center gap-2 px-4 py-2 rounded-lg font-medium bg-slate-700 hover:bg-slate-600 text-white transition-all">
+                    <button onclick="triggerSyncAndRefresh()" class="flex items-center gap-2 px-4 py-2 rounded-lg font-medium bg-slate-700 hover:bg-slate-600 text-white transition-all">
                         <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
                         </svg>
-                        Refresh
+                        <span id="refreshButtonText">Refresh</span>
                     </button>
                 </div>
             </div>
@@ -208,7 +208,7 @@
                         Last Updated: <span id="lastUpdate">-</span>
                     </p>
                     <p class="text-sm text-slate-500">
-                        Auto-refreshes every 30 seconds | API: <span id="currentEndpoint" class="font-mono text-xs"></span>
+                        Auto-refreshes every 30 seconds | Refresh button triggers full data sync | API: <span id="currentEndpoint" class="font-mono text-xs"></span>
                     </p>
                 </div>
             </div>
@@ -713,8 +713,9 @@
             fetchData();
             fetchTodayShifts();
             
-            // Set up auto-refresh every 30 seconds
+            // Set up auto-refresh every 30 seconds (without sync)
             refreshInterval = setInterval(() => {
+                // Auto-refresh only fetches data, doesn't trigger sync
                 fetchData();
                 fetchTodayShifts();
             }, 30000);
@@ -726,6 +727,94 @@
                 clearInterval(refreshInterval);
             }
         });
+
+        // New function to trigger sync and refresh
+        async function triggerSyncAndRefresh() {
+            const refreshButton = document.querySelector('button[onclick="triggerSyncAndRefresh()"]');
+            const refreshButtonText = document.getElementById('refreshButtonText');
+            
+            try {
+                // Disable button and show syncing status
+                refreshButton.disabled = true;
+                refreshButton.classList.add('opacity-50', 'cursor-not-allowed');
+                refreshButtonText.textContent = 'Syncing...';
+                
+                // Trigger the sync/all endpoint
+                let syncUrl;
+                if (API_URL.startsWith('/')) {
+                    // Relative URL - extract base path
+                    const basePath = API_URL.split('/users')[0];
+                    syncUrl = `${basePath}/sync/all`;
+                } else {
+                    // Absolute URL - extract base URL
+                    const baseUrl = API_URL.split('/users')[0];
+                    syncUrl = `${baseUrl}/sync/all`;
+                }
+                
+                try {
+                    const syncResponse = await fetch(syncUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    if (syncResponse.ok) {
+                        const syncResult = await syncResponse.json();
+                        console.log('Sync started:', syncResult);
+                        
+                        // Show sync started message
+                        refreshButtonText.textContent = 'Sync Started...';
+                        
+                        // Wait a bit for sync to process (sync runs in background)
+                        // This gives the sync some time to update data before we fetch
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    } else {
+                        console.error('Sync failed:', syncResponse.status);
+                    }
+                } catch (syncError) {
+                    console.error('Error triggering sync:', syncError);
+                    // Continue with refresh even if sync fails
+                }
+                
+                // Update button text to show fetching
+                refreshButtonText.textContent = 'Fetching...';
+                
+                // Fetch updated data
+                await fetchData();
+                await fetchTodayShifts();
+                
+                // Success - briefly show done message
+                refreshButtonText.textContent = 'Done!';
+                refreshButton.classList.remove('bg-slate-700');
+                refreshButton.classList.add('bg-green-600');
+                
+                setTimeout(() => {
+                    refreshButtonText.textContent = 'Refresh';
+                    refreshButton.classList.remove('bg-green-600');
+                    refreshButton.classList.add('bg-slate-700');
+                }, 1500);
+                
+            } catch (error) {
+                console.error('Error during sync and refresh:', error);
+                
+                // Show error state
+                refreshButtonText.textContent = 'Error!';
+                refreshButton.classList.remove('bg-slate-700');
+                refreshButton.classList.add('bg-red-600');
+                
+                setTimeout(() => {
+                    refreshButtonText.textContent = 'Refresh';
+                    refreshButton.classList.remove('bg-red-600');
+                    refreshButton.classList.add('bg-slate-700');
+                }, 2000);
+                
+            } finally {
+                // Re-enable button
+                refreshButton.disabled = false;
+                refreshButton.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        }
     </script>
 </body>
 </html>

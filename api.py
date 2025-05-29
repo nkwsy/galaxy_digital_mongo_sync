@@ -3,29 +3,114 @@ FastAPI application for Galaxy Digital MongoDB Sync
 
 This API provides REST endpoints to interact with the Galaxy Digital sync functionality,
 allowing external programs to trigger syncs, generate reports, and query data.
+
+Features:
+- Automatic scheduled sync every 15 minutes (configurable)
+- REST endpoints for manual sync triggers
+- Report generation endpoints
+- Query endpoints for data retrieval
+- Check-in/check-out status tracking
+
+Environment Variables:
+- SYNC_INTERVAL_MINUTES: Minutes between automatic syncs (default: 15)
+- ENABLE_AUTO_SYNC: Enable/disable automatic sync (default: true)
+- PORT: API server port (default: 8000)
+
+To disable automatic sync:
+  export ENABLE_AUTO_SYNC=false
+
+To change sync interval to 30 minutes:
+  export SYNC_INTERVAL_MINUTES=30
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import os
 from enum import Enum
 from loguru import logger
+import asyncio
+from contextlib import asynccontextmanager
 
 # Import the sync tool
 from galaxy_api_sync import GalaxyAPISync
+
+# Global sync tool instance
+sync_tool = None
+# Global background task for scheduled syncs
+scheduled_sync_task = None
+
+# Configuration
+SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "15"))  # Default 15 minutes
+ENABLE_AUTO_SYNC = os.getenv("ENABLE_AUTO_SYNC", "true").lower() == "true"
+
+# Background sync function
+async def run_scheduled_sync():
+    """Run sync on a schedule"""
+    while True:
+        try:
+            logger.info(f"Starting scheduled sync (runs every {SYNC_INTERVAL_MINUTES} minutes)")
+            
+            # Run sync in a thread to not block the event loop
+            await asyncio.get_event_loop().run_in_executor(
+                None, 
+                sync_tool.sync_all_resources
+            )
+            
+            # Also generate reports after sync
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                sync_tool.generate_activity_reports
+            )
+            
+            logger.info("Scheduled sync completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error in scheduled sync: {str(e)}")
+        
+        # Wait for the specified interval
+        await asyncio.sleep(SYNC_INTERVAL_MINUTES * 60)
+
+# Lifespan context manager for startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global sync_tool, scheduled_sync_task
+    try:
+        sync_tool = GalaxyAPISync()
+        logger.info("Galaxy Digital Sync Tool initialized successfully")
+        
+        # Start scheduled sync if enabled
+        if ENABLE_AUTO_SYNC:
+            scheduled_sync_task = asyncio.create_task(run_scheduled_sync())
+            logger.info(f"Scheduled sync enabled - will run every {SYNC_INTERVAL_MINUTES} minutes")
+        else:
+            logger.info("Scheduled sync is disabled")
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize sync tool: {str(e)}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    if scheduled_sync_task:
+        scheduled_sync_task.cancel()
+        try:
+            await scheduled_sync_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Scheduled sync task cancelled")
 
 # Create FastAPI app
 app = FastAPI(
     title="Galaxy Digital MongoDB Sync API",
     description="REST API for synchronizing Galaxy Digital data with MongoDB and generating reports",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
-
-# Global sync tool instance
-sync_tool = None
 
 # Enum for report types
 class ReportType(str, Enum):
@@ -71,17 +156,6 @@ class CheckinStatusQuery(BaseModel):
     end_date: Optional[datetime] = None
     limit: int = 100
 
-# Initialize sync tool on startup
-@app.on_event("startup")
-async def startup_event():
-    global sync_tool
-    try:
-        sync_tool = GalaxyAPISync()
-        logger.info("Galaxy Digital Sync Tool initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize sync tool: {str(e)}")
-        raise
-
 # Health check endpoint
 @app.get("/health")
 async def health_check():
@@ -89,13 +163,64 @@ async def health_check():
     try:
         # Test database connection
         sync_tool.db.list_collection_names()
+        
+        # Check scheduled sync status
+        scheduled_sync_status = "disabled"
+        if ENABLE_AUTO_SYNC:
+            if scheduled_sync_task and not scheduled_sync_task.done():
+                scheduled_sync_status = "running"
+            else:
+                scheduled_sync_status = "error"
+        
         return {
             "status": "healthy",
             "database": "connected",
+            "scheduled_sync": {
+                "enabled": ENABLE_AUTO_SYNC,
+                "status": scheduled_sync_status,
+                "interval_minutes": SYNC_INTERVAL_MINUTES
+            },
             "timestamp": datetime.utcnow()
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
+
+# Sync status endpoint
+@app.get("/sync/status")
+async def get_sync_status():
+    """Get the status of scheduled syncs and last sync times"""
+    try:
+        # Get last sync times from metadata
+        metadata_collection = sync_tool.db["sync_metadata"]
+        metadata = list(metadata_collection.find({}))
+        
+        sync_times = {}
+        for item in metadata:
+            resource = item.get("resource")
+            last_sync = item.get("last_sync")
+            if resource and last_sync:
+                sync_times[resource] = last_sync
+        
+        # Calculate next scheduled sync time if enabled
+        next_sync_time = None
+        if ENABLE_AUTO_SYNC and sync_times:
+            # Find the most recent sync time
+            most_recent_sync = max(sync_times.values())
+            # Calculate next sync time
+            next_sync_time = most_recent_sync + timedelta(minutes=SYNC_INTERVAL_MINUTES)
+        
+        return {
+            "scheduled_sync": {
+                "enabled": ENABLE_AUTO_SYNC,
+                "status": "running" if (scheduled_sync_task and not scheduled_sync_task.done()) else "stopped",
+                "interval_minutes": SYNC_INTERVAL_MINUTES,
+                "next_sync_time": next_sync_time
+            },
+            "last_sync_times": sync_times,
+            "current_time": datetime.utcnow()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Sync endpoints
 @app.post("/sync/all", response_model=SyncResponse)

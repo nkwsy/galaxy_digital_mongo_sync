@@ -944,27 +944,121 @@ class GalaxyAPISync:
                 logger.warning(f"Missing required collections: {missing_collections}. Skipping shift status generation.")
                 return
             
+            # Get the last sync time for shift_status to enable incremental updates
+            last_sync_time = self._get_last_sync_time("shift_status")
+            is_incremental = last_sync_time is not None
+            
+            if is_incremental:
+                logger.info(f"Using incremental sync for shift_status since: {last_sync_time}")
+            else:
+                logger.info("Performing full sync for shift_status (no previous sync time found)")
+            
             # Get the current date for filtering future shifts
             now = datetime.datetime.utcnow()
             
+            # Track which shifts need updating
+            shifts_to_update = set()  # Set of shift IDs that need updating
+            affected_needs = set()    # Set of need IDs that have changed
+            
+            # 1. Find needs that have been updated since last sync
+            if is_incremental:
+                # Find needs updated since last sync
+                needs_filter = {"_synced_at": {"$gte": last_sync_time}}
+                updated_needs = list(self.db["needs"].find(needs_filter, {"id": 1, "shifts.id": 1}))
+                
+                for need in updated_needs:
+                    need_id = need.get("id")
+                    if need_id:
+                        affected_needs.add(need_id)
+                        # Add all shifts from this need to the update list
+                        shifts = need.get("shifts", [])
+                        for shift in shifts:
+                            if shift and shift.get("id"):
+                                shifts_to_update.add(shift.get("id"))
+                
+                logger.info(f"Found {len(affected_needs)} needs updated since last sync")
+                
+                # Find responses updated since last sync
+                responses_filter = {"_synced_at": {"$gte": last_sync_time}}
+                updated_responses = list(self.db["responses"].find(
+                    responses_filter, 
+                    {"need.id": 1, "shift.id": 1}
+                ))
+                
+                for response in updated_responses:
+                    need_id = response.get("need", {}).get("id")
+                    shift_id = response.get("shift", {}).get("id")
+                    if need_id:
+                        affected_needs.add(need_id)
+                    if shift_id:
+                        shifts_to_update.add(shift_id)
+                
+                logger.info(f"Found {len(updated_responses)} responses updated since last sync")
+                
+                # Find hours updated since last sync
+                hours_filter = {"_synced_at": {"$gte": last_sync_time}}
+                updated_hours = list(self.db["hours"].find(
+                    hours_filter,
+                    {"need.id": 1, "shift.id": 1}
+                ))
+                
+                for hour in updated_hours:
+                    need_id = hour.get("need", {}).get("id")
+                    shift_id = hour.get("shift", {}).get("id")
+                    if need_id:
+                        affected_needs.add(need_id)
+                    if shift_id:
+                        shifts_to_update.add(shift_id)
+                
+                logger.info(f"Found {len(updated_hours)} hours updated since last sync")
+                logger.info(f"Total affected needs: {len(affected_needs)}, shifts to update: {len(shifts_to_update)}")
+            
+            # If no changes detected in incremental mode, skip processing
+            if is_incremental and len(affected_needs) == 0 and len(shifts_to_update) == 0:
+                logger.info("No changes detected since last sync. Skipping shift status update.")
+                # Still update the sync metadata to track that we checked
+                self._update_sync_metadata("shift_status")
+                return
+            
             # Extract needs and create basic shift records
-            shift_status_list = self._create_shifts_from_needs(future_only, now)
+            if is_incremental:
+                # Only process affected needs
+                shift_status_list = self._create_shifts_from_needs_incremental(
+                    future_only, now, affected_needs, shifts_to_update
+                )
+            else:
+                # Full sync - process all needs
+                shift_status_list = self._create_shifts_from_needs(future_only, now)
             
             # For each shift, assign users based on responses
-            self._assign_users_from_responses(shift_status_list)
+            if is_incremental:
+                self._assign_users_from_responses_incremental(shift_status_list, last_sync_time)
+            else:
+                self._assign_users_from_responses(shift_status_list)
             
             # Update user status based on hours
-            self._correlate_hours_to_shifts(shift_status_list)
+            if is_incremental:
+                self._correlate_hours_to_shifts_incremental(shift_status_list, last_sync_time)
+            else:
+                self._correlate_hours_to_shifts(shift_status_list)
             
             # Save the shift status data to MongoDB
-            self._save_shift_status_data(shift_status_list)
+            if is_incremental:
+                self._save_shift_status_data_incremental(shift_status_list)
+            else:
+                self._save_shift_status_data(shift_status_list)
             
-            # Create indexes for efficient querying
-            self.db["shift_status"].create_index([("id", pymongo.ASCENDING)], unique=True)
-            self.db["shift_status"].create_index([("start", pymongo.ASCENDING)])
-            self.db["shift_status"].create_index([("need_id", pymongo.ASCENDING)])
-            self.db["shift_status"].create_index([("users.id", pymongo.ASCENDING)])
-            self.db["shift_status"].create_index([("users.checkin_status", pymongo.ASCENDING)])
+            # Create indexes for efficient querying (only if not already created)
+            try:
+                self.db["shift_status"].create_index([("id", pymongo.ASCENDING)], unique=True)
+                self.db["shift_status"].create_index([("start", pymongo.ASCENDING)])
+                self.db["shift_status"].create_index([("need_id", pymongo.ASCENDING)])
+                self.db["shift_status"].create_index([("users.id", pymongo.ASCENDING)])
+                self.db["shift_status"].create_index([("users.checkin_status", pymongo.ASCENDING)])
+                self.db["shift_status"].create_index([("_synced_at", pymongo.DESCENDING)])
+            except pymongo.errors.OperationFailure:
+                # Indexes already exist
+                pass
             
             # Update sync metadata to track when this was last generated
             self._update_sync_metadata("shift_status")
@@ -972,202 +1066,6 @@ class GalaxyAPISync:
         except Exception as e:
             logger.error(f"Error generating shift status collection: {str(e)}")
             raise
-            
-    def _create_shifts_from_needs(self, future_only: bool, current_time: datetime.datetime) -> list:
-        """
-        Create shift records from needs documents.
-        
-        This function extracts shifts from needs documents and creates basic shift records
-        with their properties (id, start time, end time, duration, etc.)
-        
-        Args:
-            future_only: If True, only include shifts that start in the future
-            current_time: The current time to use for filtering future shifts
-            
-        Returns:
-            List of shift status records (dictionaries)
-        """
-        logger.info("Creating shifts from needs...")
-        
-        # Query all needs that have shifts array
-        needs_filter = {"shifts": {"$exists": True, "$ne": []}}
-        
-        # Add future only filter if requested
-        if future_only:
-            logger.info(f"Generating shift status for future shifts only (after {current_time})")
-            needs_filter["shifts.start"] = {"$gte": current_time}
-        else:
-            logger.info("Generating shift status for all shifts (past, current, and future)")
-            
-        # Count before query for debugging
-        total_needs = self.db["needs"].count_documents({})
-        needs_with_shifts = self.db["needs"].count_documents(needs_filter)
-        logger.info(f"Total needs in database: {total_needs}")
-        logger.info(f"Needs matching filter: {needs_with_shifts}")
-        
-        needs = list(self.db["needs"].find(needs_filter))
-        logger.info(f"Found {len(needs)} needs with shifts to process")
-        
-        # If no needs with shifts were found, check alternative fields
-        if len(needs) == 0:
-            logger.warning("No needs with 'shifts' field found. Checking for alternative fields...")
-            # Try looking for needs with date fields that could represent shifts
-            alt_filter = {
-                "need_date_start": {"$exists": True},
-                "need_date_end": {"$exists": True}
-            }
-            alt_needs_count = self.db["needs"].count_documents(alt_filter)
-            logger.info(f"Found {alt_needs_count} needs with date fields")
-            
-            if alt_needs_count > 0:
-                # Use these needs instead
-                needs = list(self.db["needs"].find(alt_filter))
-                logger.info(f"Using {len(needs)} needs with date fields")
-        
-        # Create a list to store the processed shifts
-        shift_status_list = []
-        
-        # Process each need and its shifts
-        for need in needs:
-            try:
-                need_id = need.get("id")
-                
-                if not need_id:
-                    logger.warning(f"Need missing ID, skipping: {need}")
-                    continue
-                
-                # Process each shift in the need
-                shifts = need.get("shifts", [])
-                logger.debug(f"Processing {len(shifts)} shifts for need {need_id}: {need.get('need_title')}")
-                
-                # Special case for problematic need IDs
-                problematic_need_ids = [800197]
-                is_problematic_need = need_id in problematic_need_ids
-                
-                if is_problematic_need and (not shifts or len(shifts) == 0):
-                    # Handle special cases
-                    synthetic_shifts = self._create_synthetic_shifts_for_need(need_id)
-                    if synthetic_shifts:
-                        shifts = synthetic_shifts
-                        logger.info(f"Using {len(shifts)} synthetic shifts for need {need_id}")
-                
-                for shift_index, shift in enumerate(shifts):
-                    try:
-                        # Add additional debug logging
-                        logger.debug(f"  Processing shift {shift_index+1}/{len(shifts)}: {shift}")
-                        
-                        # Safely get shift ID
-                        shift_id = shift.get("id") if shift else None
-                        if not shift_id:
-                            logger.warning(f"Shift missing ID in need {need_id}, skipping: {shift}")
-                            continue
-                        
-                        # Create the basic shift status entry
-                        shift_status = {
-                            "id": shift_id,
-                            "start": shift.get("start"),
-                            "end": shift.get("end"),
-                            "duration": shift.get("duration") or need.get("need_hours"),
-                            "slots": shift.get("slots") or 0,
-                            "need_id": need_id,
-                            "title": need.get("need_title"),
-                            "users": [],  # Will be populated later
-                            "slots_filled": 0,  # Will be calculated later
-                            "_synced_at": datetime.datetime.utcnow(),
-                            "_sync_source": "aggregation"
-                        }
-                        
-                        # Add to our collection of shift statuses
-                        shift_status_list.append(shift_status)
-                    except Exception as e:
-                        logger.error(f"Error processing shift {shift_index if 'shift_index' in locals() else '?'} for need {need_id}: {str(e)}")
-            except Exception as e:
-                logger.error(f"Error processing need {need.get('id')}: {str(e)}")
-                
-        logger.info(f"Created {len(shift_status_list)} shift records from needs")
-        return shift_status_list
-        
-    def _create_synthetic_shifts_for_need(self, need_id: int) -> list:
-        """
-        Create synthetic shifts for a need that doesn't have a shifts array.
-        
-        This function looks at hours data to create synthetic shifts when the
-        standard shifts data is not available.
-        
-        Args:
-            need_id: The ID of the need to create synthetic shifts for
-            
-        Returns:
-            List of synthetic shift dictionaries
-        """
-        logger.info(f"Special handling for known problematic need ID: {need_id}")
-        synthetic_shifts = []
-        
-        try:
-            # Find all hours for this need to create synthetic shifts
-            hours = list(self.db["hours"].find({"need.id": need_id}))
-            if hours:
-                logger.info(f"Found {len(hours)} hours for problematic need {need_id}. Creating synthetic shifts.")
-                
-                # Group hours by day to create one shift per day
-                hours_by_day = {}
-                
-                for hour in hours:
-                    # Get the date portion only to group by day
-                    hour_start = hour.get("hour_date_start") or hour.get("date_start")
-                    
-                    if not hour_start:
-                        continue
-                        
-                    # Convert to date for grouping if it's a datetime
-                    if isinstance(hour_start, datetime.datetime):
-                        day_key = hour_start.strftime("%Y-%m-%d")
-                    else:
-                        # If not a datetime, try to extract date portion
-                        if isinstance(hour_start, str):
-                            day_key = hour_start.split(' ')[0]
-                        else:
-                            # Skip if we can't determine the day
-                            continue
-                            
-                    if day_key not in hours_by_day:
-                        hours_by_day[day_key] = []
-                        
-                    hours_by_day[day_key].append(hour)
-                
-                # Create synthetic shifts for each day
-                for day, day_hours in hours_by_day.items():
-                    # Find earliest start and latest end for the day
-                    min_start = None
-                    max_end = None
-                    
-                    for hour in day_hours:
-                        hour_start = hour.get("hour_date_start") or hour.get("date_start")
-                        hour_end = hour.get("hour_date_end") or hour.get("date_end")
-                        
-                        if hour_start and (min_start is None or hour_start < min_start):
-                            min_start = hour_start
-                            
-                        if hour_end and (max_end is None or hour_end > max_end):
-                            max_end = hour_end
-                    
-                    if min_start and max_end:
-                        # Create a synthetic shift for this day using first hour's ID as shift ID
-                        synthetic_shift = {
-                            "id": day_hours[0].get("id") if day_hours else f"synthetic_{day}",
-                            "start": min_start,
-                            "end": max_end,
-                            "duration": sum(float(h.get("hour_duration") or 0) for h in day_hours) / len(day_hours),
-                            "slots": len(day_hours)
-                        }
-                        synthetic_shifts.append(synthetic_shift)
-                        logger.info(f"Created synthetic shift for {day} with {len(day_hours)} hours")
-            else:
-                logger.warning(f"No hours found for problematic need {need_id}")
-        except Exception as e:
-            logger.error(f"Error creating synthetic shifts for need {need_id}: {str(e)}")
-            
-        return synthetic_shifts
 
     def _generate_time_based_activity(self) -> None:
         """
@@ -2436,6 +2334,687 @@ class GalaxyAPISync:
         except Exception as e:
             logger.error(f"Error generating check-in/check-out analysis collection: {str(e)}")
             raise
+
+    def _create_shifts_from_needs(self, future_only: bool, current_time: datetime.datetime) -> list:
+        """
+        Create shift records from needs documents.
+        
+        This function extracts shifts from needs documents and creates basic shift records
+        with their properties (id, start time, end time, duration, etc.)
+        
+        Args:
+            future_only: If True, only include shifts that start in the future
+            current_time: The current time to use for filtering future shifts
+            
+        Returns:
+            List of shift status records (dictionaries)
+        """
+        logger.info("Creating shifts from needs...")
+        
+        # Query all needs that have shifts array
+        needs_filter = {"shifts": {"$exists": True, "$ne": []}}
+        
+        # Add future only filter if requested
+        if future_only:
+            logger.info(f"Generating shift status for future shifts only (after {current_time})")
+            needs_filter["shifts.start"] = {"$gte": current_time}
+        else:
+            logger.info("Generating shift status for all shifts (past, current, and future)")
+            
+        # Count before query for debugging
+        total_needs = self.db["needs"].count_documents({})
+        needs_with_shifts = self.db["needs"].count_documents(needs_filter)
+        logger.info(f"Total needs in database: {total_needs}")
+        logger.info(f"Needs matching filter: {needs_with_shifts}")
+        
+        needs = list(self.db["needs"].find(needs_filter))
+        logger.info(f"Found {len(needs)} needs with shifts to process")
+        
+        # If no needs with shifts were found, check alternative fields
+        if len(needs) == 0:
+            logger.warning("No needs with 'shifts' field found. Checking for alternative fields...")
+            # Try looking for needs with date fields that could represent shifts
+            alt_filter = {
+                "need_date_start": {"$exists": True},
+                "need_date_end": {"$exists": True}
+            }
+            alt_needs_count = self.db["needs"].count_documents(alt_filter)
+            logger.info(f"Found {alt_needs_count} needs with date fields")
+            
+            if alt_needs_count > 0:
+                # Use these needs instead
+                needs = list(self.db["needs"].find(alt_filter))
+                logger.info(f"Using {len(needs)} needs with date fields")
+        
+        # Create a list to store the processed shifts
+        shift_status_list = []
+        
+        # Process each need and its shifts
+        for need in needs:
+            try:
+                need_id = need.get("id")
+                
+                if not need_id:
+                    logger.warning(f"Need missing ID, skipping: {need}")
+                    continue
+                
+                # Process each shift in the need
+                shifts = need.get("shifts", [])
+                logger.debug(f"Processing {len(shifts)} shifts for need {need_id}: {need.get('need_title')}")
+                
+                # Special case for problematic need IDs
+                problematic_need_ids = [800197]
+                is_problematic_need = need_id in problematic_need_ids
+                
+                if is_problematic_need and (not shifts or len(shifts) == 0):
+                    # Handle special cases
+                    synthetic_shifts = self._create_synthetic_shifts_for_need(need_id)
+                    if synthetic_shifts:
+                        shifts = synthetic_shifts
+                        logger.info(f"Using {len(shifts)} synthetic shifts for need {need_id}")
+                
+                for shift_index, shift in enumerate(shifts):
+                    try:
+                        # Add additional debug logging
+                        logger.debug(f"  Processing shift {shift_index+1}/{len(shifts)}: {shift}")
+                        
+                        # Safely get shift ID
+                        shift_id = shift.get("id") if shift else None
+                        if not shift_id:
+                            logger.warning(f"Shift missing ID in need {need_id}, skipping: {shift}")
+                            continue
+                        
+                        # Create the basic shift status entry
+                        shift_status = {
+                            "id": shift_id,
+                            "start": shift.get("start"),
+                            "end": shift.get("end"),
+                            "duration": shift.get("duration") or need.get("need_hours"),
+                            "slots": shift.get("slots") or 0,
+                            "need_id": need_id,
+                            "title": need.get("need_title"),
+                            "users": [],  # Will be populated later
+                            "slots_filled": 0,  # Will be calculated later
+                            "_synced_at": datetime.datetime.utcnow(),
+                            "_sync_source": "aggregation"
+                        }
+                        
+                        # Add to our collection of shift statuses
+                        shift_status_list.append(shift_status)
+                    except Exception as e:
+                        logger.error(f"Error processing shift {shift_index if 'shift_index' in locals() else '?'} for need {need_id}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error processing need {need.get('id')}: {str(e)}")
+                
+        logger.info(f"Created {len(shift_status_list)} shift records from needs")
+        return shift_status_list
+        
+    def _create_synthetic_shifts_for_need(self, need_id: int) -> list:
+        """
+        Create synthetic shifts for a need that doesn't have a shifts array.
+        
+        This function looks at hours data to create synthetic shifts when the
+        standard shifts data is not available.
+        
+        Args:
+            need_id: The ID of the need to create synthetic shifts for
+            
+        Returns:
+            List of synthetic shift dictionaries
+        """
+        logger.info(f"Special handling for known problematic need ID: {need_id}")
+        synthetic_shifts = []
+        
+        try:
+            # Find all hours for this need to create synthetic shifts
+            hours = list(self.db["hours"].find({"need.id": need_id}))
+            if hours:
+                logger.info(f"Found {len(hours)} hours for problematic need {need_id}. Creating synthetic shifts.")
+                
+                # Group hours by day to create one shift per day
+                hours_by_day = {}
+                
+                for hour in hours:
+                    # Get the date portion only to group by day
+                    hour_start = hour.get("hour_date_start") or hour.get("date_start")
+                    
+                    if not hour_start:
+                        continue
+                        
+                    # Convert to date for grouping if it's a datetime
+                    if isinstance(hour_start, datetime.datetime):
+                        day_key = hour_start.strftime("%Y-%m-%d")
+                    else:
+                        # If not a datetime, try to extract date portion
+                        if isinstance(hour_start, str):
+                            day_key = hour_start.split(' ')[0]
+                        else:
+                            # Skip if we can't determine the day
+                            continue
+                            
+                    if day_key not in hours_by_day:
+                        hours_by_day[day_key] = []
+                        
+                    hours_by_day[day_key].append(hour)
+                
+                # Create synthetic shifts for each day
+                for day, day_hours in hours_by_day.items():
+                    # Find earliest start and latest end for the day
+                    min_start = None
+                    max_end = None
+                    
+                    for hour in day_hours:
+                        hour_start = hour.get("hour_date_start") or hour.get("date_start")
+                        hour_end = hour.get("hour_date_end") or hour.get("date_end")
+                        
+                        if hour_start and (min_start is None or hour_start < min_start):
+                            min_start = hour_start
+                            
+                        if hour_end and (max_end is None or hour_end > max_end):
+                            max_end = hour_end
+                    
+                    if min_start and max_end:
+                        # Create a synthetic shift for this day using first hour's ID as shift ID
+                        synthetic_shift = {
+                            "id": day_hours[0].get("id") if day_hours else f"synthetic_{day}",
+                            "start": min_start,
+                            "end": max_end,
+                            "duration": sum(float(h.get("hour_duration") or 0) for h in day_hours) / len(day_hours),
+                            "slots": len(day_hours)
+                        }
+                        synthetic_shifts.append(synthetic_shift)
+                        logger.info(f"Created synthetic shift for {day} with {len(day_hours)} hours")
+            else:
+                logger.warning(f"No hours found for problematic need {need_id}")
+        except Exception as e:
+            logger.error(f"Error creating synthetic shifts for need {need_id}: {str(e)}")
+            
+        return synthetic_shifts
+
+    def _create_shifts_from_needs_incremental(
+        self, 
+        future_only: bool, 
+        current_time: datetime.datetime, 
+        affected_needs: set,
+        shifts_to_update: set
+    ) -> list:
+        """
+        Create shift records from needs documents (incremental version).
+        
+        This incremental version only processes needs that have been affected
+        by recent changes, dramatically reducing processing time.
+        
+        Args:
+            future_only: If True, only include shifts that start in the future
+            current_time: The current time to use for filtering future shifts
+            affected_needs: Set of need IDs that have been affected by changes
+            shifts_to_update: Set of shift IDs that need updating
+            
+        Returns:
+            List of shift status records (dictionaries) that need updating
+        """
+        logger.info(f"Creating shifts from {len(affected_needs)} affected needs (incremental)...")
+        
+        # Query only affected needs
+        needs_filter = {
+            "id": {"$in": list(affected_needs)},
+            "shifts": {"$exists": True, "$ne": []}
+        }
+        
+        # Add future only filter if requested
+        if future_only:
+            needs_filter["shifts.start"] = {"$gte": current_time}
+        
+        needs = list(self.db["needs"].find(needs_filter))
+        logger.info(f"Found {len(needs)} affected needs with shifts to process")
+        
+        # Also check if we need to include needs that might have shifts matching our shifts_to_update
+        if shifts_to_update:
+            # Find additional needs that contain any of the shifts we need to update
+            additional_needs_filter = {"shifts.id": {"$in": list(shifts_to_update)}}
+            additional_needs = list(self.db["needs"].find(additional_needs_filter))
+            
+            # Merge with existing needs, avoiding duplicates
+            existing_need_ids = {n.get("id") for n in needs}
+            for need in additional_needs:
+                if need.get("id") not in existing_need_ids:
+                    needs.append(need)
+            
+            logger.info(f"Added {len(additional_needs)} additional needs containing updated shifts")
+        
+        # Create a list to store the processed shifts
+        shift_status_list = []
+        
+        # Process each need and its shifts
+        for need in needs:
+            try:
+                need_id = need.get("id")
+                
+                if not need_id:
+                    continue
+                
+                # Process each shift in the need
+                shifts = need.get("shifts", [])
+                
+                for shift in shifts:
+                    if not shift:
+                        continue
+                        
+                    shift_id = shift.get("id")
+                    if not shift_id:
+                        continue
+                    
+                    # Only process shifts that are in our update list or belong to affected needs
+                    if shift_id in shifts_to_update or need_id in affected_needs:
+                        # Create the basic shift status entry
+                        shift_status = {
+                            "id": shift_id,
+                            "start": shift.get("start"),
+                            "end": shift.get("end"),
+                            "duration": shift.get("duration") or need.get("need_hours"),
+                            "slots": shift.get("slots") or 0,
+                            "need_id": need_id,
+                            "title": need.get("need_title"),
+                            "users": [],  # Will be populated later
+                            "slots_filled": 0,  # Will be calculated later
+                            "_synced_at": datetime.datetime.utcnow(),
+                            "_sync_source": "aggregation"
+                        }
+                        
+                        shift_status_list.append(shift_status)
+                        
+            except Exception as e:
+                logger.error(f"Error processing need {need.get('id')} in incremental sync: {str(e)}")
+        
+        logger.info(f"Created {len(shift_status_list)} shift records from affected needs")
+        return shift_status_list
+
+    def _assign_users_from_responses_incremental(
+        self, 
+        shift_status_list: list, 
+        last_sync_time: datetime.datetime
+    ) -> None:
+        """
+        Assign users to shifts based on responses (incremental version).
+        
+        This incremental version only processes responses that have been updated
+        since the last sync time.
+        
+        Args:
+            shift_status_list: List of shift status records to update
+            last_sync_time: The last time this collection was synced
+        """
+        logger.info("Assigning users to shifts based on responses (incremental)...")
+        
+        # Get shift IDs from our list
+        shift_ids = {shift.get("id") for shift in shift_status_list if shift.get("id")}
+        need_ids = {shift.get("need_id") for shift in shift_status_list if shift.get("need_id")}
+        
+        # Find responses that have been updated since last sync and match our shifts
+        responses_filter = {
+            "$or": [
+                {"shift.id": {"$in": list(shift_ids)}},
+                {"need.id": {"$in": list(need_ids)}}
+            ],
+            "_synced_at": {"$gte": last_sync_time}
+        }
+        
+        responses = list(self.db["responses"].find(responses_filter))
+        logger.info(f"Found {len(responses)} updated responses for affected shifts")
+        
+        # Create a mapping of shift_id to shift for faster lookup
+        shift_map = {shift["id"]: shift for shift in shift_status_list if shift.get("id")}
+        
+        # Process each response
+        for response in responses:
+            if not response:
+                continue
+                
+            # Get shift info from response
+            shift_obj = response.get("shift", {})
+            shift_id = shift_obj.get("id") if shift_obj else None
+            
+            # If no shift ID, try to match by need ID
+            if not shift_id:
+                need_id = response.get("need", {}).get("id")
+                if need_id:
+                    # Find shifts for this need
+                    for shift in shift_status_list:
+                        if shift.get("need_id") == need_id:
+                            shift_id = shift.get("id")
+                            break
+            
+            if not shift_id or shift_id not in shift_map:
+                continue
+                
+            shift = shift_map[shift_id]
+            
+            # Get user info from response
+            user_obj = response.get("user", {})
+            user_id = user_obj.get("id") if user_obj else None
+            
+            if not user_id:
+                continue
+            
+            # Get response status
+            response_status = response.get("response_status") or response.get("status")
+            
+            # Determine initial checkin status based on response
+            if response_status and response_status.lower() == "active":
+                checkin_status = "pending"
+            elif response_status and response_status.lower() == "inactive":
+                checkin_status = "cancelled"
+            else:
+                checkin_status = "absent"
+            
+            # Create user entry
+            user_entry = {
+                "id": user_id,
+                "domain_id": user_obj.get("domain_id"),
+                "user_fname": user_obj.get("user_fname"),
+                "user_lname": user_obj.get("user_lname"),
+                "user_email": user_obj.get("user_email"),
+                "checkin_status": checkin_status
+            }
+            
+            # Check if user already exists in shift
+            existing_user = next((u for u in shift["users"] if u.get("id") == user_id), None)
+            if existing_user:
+                # Update existing user if status would change
+                if checkin_status != "absent" and existing_user.get("checkin_status") == "absent":
+                    existing_user["checkin_status"] = checkin_status
+            else:
+                shift["users"].append(user_entry)
+        
+        logger.info(f"Assigned users to shifts based on {len(responses)} updated responses")
+
+    def _correlate_hours_to_shifts_incremental(
+        self, 
+        shift_status_list: list, 
+        last_sync_time: datetime.datetime
+    ) -> None:
+        """
+        Correlate hours to shifts and update user status (incremental version).
+        
+        This incremental version only processes hours that have been updated
+        since the last sync time.
+        
+        Args:
+            shift_status_list: List of shift status records to update
+            last_sync_time: The last time this collection was synced
+        """
+        logger.info("Correlating hours to shifts (incremental)...")
+        
+        # Get need IDs from our shift list
+        need_ids = {shift.get("need_id") for shift in shift_status_list if shift.get("need_id")}
+        
+        # Find hours that have been updated since last sync and match our needs
+        hours_filter = {
+            "need.id": {"$in": list(need_ids)},
+            "_synced_at": {"$gte": last_sync_time}
+        }
+        
+        hours = list(self.db["hours"].find(hours_filter))
+        logger.info(f"Found {len(hours)} updated hours for affected needs")
+        
+        # Build an index of shifts by need_id for faster lookup
+        shifts_by_need = {}
+        for shift in shift_status_list:
+            need_id = shift.get("need_id")
+            if need_id:
+                if need_id not in shifts_by_need:
+                    shifts_by_need[need_id] = []
+                shifts_by_need[need_id].append(shift)
+        
+        # Process each hour
+        for hour in hours:
+            if not hour:
+                continue
+                
+            # Get need ID from hour
+            need_id = hour.get("need", {}).get("id")
+            if not need_id or need_id not in shifts_by_need:
+                continue
+                
+            # Get user info
+            user_obj = hour.get("user", {})
+            user_id = user_obj.get("id") if user_obj else None
+            
+            if not user_id:
+                continue
+            
+            # Get hour details
+            hour_start = hour.get("hour_date_start") or hour.get("date_start")
+            hour_end = hour.get("hour_date_end") or hour.get("date_end")
+            hour_shift = hour.get("shift", {})
+            hour_shift_id = hour_shift.get("id") if hour_shift else None
+            
+            # Find matching shift(s) for this hour
+            matching_shifts = []
+            
+            # First try direct shift ID match if available
+            if hour_shift_id:
+                for shift in shifts_by_need[need_id]:
+                    if shift.get("id") == hour_shift_id:
+                        matching_shifts.append(shift)
+                        break
+            
+            # If no direct match, try time-based matching
+            if not matching_shifts and hour_start:
+                for shift in shifts_by_need[need_id]:
+                    shift_start = shift.get("start")
+                    shift_end = shift.get("end")
+                    
+                    if not shift_start:
+                        continue
+                    
+                    # Check for time overlap or same date
+                    if self._hours_match_shift(hour_start, hour_end, shift_start, shift_end):
+                        matching_shifts.append(shift)
+            
+            # Update user status in matching shifts
+            for shift in matching_shifts:
+                # Find or create user entry
+                user_entry = next((u for u in shift["users"] if u.get("id") == user_id), None)
+                
+                if not user_entry:
+                    user_entry = {
+                        "id": user_id,
+                        "domain_id": user_obj.get("domain_id"),
+                        "user_fname": user_obj.get("user_fname"),
+                        "user_lname": user_obj.get("user_lname"),
+                        "user_email": user_obj.get("user_email"),
+                        "checkin_status": "absent"
+                    }
+                    shift["users"].append(user_entry)
+                
+                # Update user entry with hour information
+                self._update_user_entry_from_hour(user_entry, hour)
+        
+        # Calculate slots_filled for each shift
+        for shift in shift_status_list:
+            shift["slots_filled"] = sum(1 for user in shift["users"] if user.get("checkin_status") != "cancelled")
+        
+        logger.info(f"Updated user status based on {len(hours)} updated hours")
+
+    def _hours_match_shift(
+        self, 
+        hour_start: datetime.datetime, 
+        hour_end: datetime.datetime,
+        shift_start: datetime.datetime, 
+        shift_end: datetime.datetime
+    ) -> bool:
+        """
+        Check if hour times match a shift.
+        
+        Args:
+            hour_start: Start time of the hour
+            hour_end: End time of the hour
+            shift_start: Start time of the shift
+            shift_end: End time of the shift
+            
+        Returns:
+            True if the hour matches the shift, False otherwise
+        """
+        if not hour_start or not shift_start:
+            return False
+            
+        # Case 1: Exact match
+        if hour_start == shift_start and hour_end == shift_end:
+            return True
+            
+        # Case 2: Hour is within shift
+        if shift_end and hour_start >= shift_start and hour_end and hour_end <= shift_end:
+            return True
+            
+        # Case 3: Same date match when time precision is limited
+        if hasattr(hour_start, 'date') and hasattr(shift_start, 'date'):
+            if hour_start.date() == shift_start.date():
+                # If on the same day, consider it a match if times are close
+                if isinstance(hour_start, datetime.datetime) and isinstance(shift_start, datetime.datetime):
+                    time_diff = abs((hour_start - shift_start).total_seconds()) / 3600
+                    return time_diff <= 1
+                else:
+                    return True
+                    
+        return False
+
+    def _update_user_entry_from_hour(self, user_entry: dict, hour: dict) -> None:
+        """
+        Update a user entry with information from an hour record.
+        
+        Args:
+            user_entry: User entry dictionary to update
+            hour: Hour record with information to apply
+        """
+        hour_status = hour.get("hour_status") or hour.get("status")
+        hour_created = hour.get("hour_date_created") or hour.get("created_at")
+        hour_updated = hour.get("hour_date_updated") or hour.get("updated_at")
+        hour_duration = hour.get("hour_duration") or hour.get("hour_hours") or hour.get("duration")
+        hour_source = hour.get("hour_source") or ""
+        
+        # Determine the user's check-in status based on hour data
+        if hour_status and ("denied" in hour_status.lower() or "reject" in hour_status.lower()):
+            checkin_status = "cancelled"
+        elif hour_status and ("approved" in hour_status.lower() or hour_status.lower() == "a"):
+            checkin_status = "completed"
+        elif hour_duration and float(hour_duration or 0) > 0:
+            checkin_status = "completed"
+        elif hour_created and hour_updated and hour_created != hour_updated:
+            checkin_status = "completed"
+        else:
+            checkin_status = "active"
+        
+        # Analyze check-in/check-out patterns
+        has_checkin = "checkin" in hour_source.lower() if hour_source else False
+        has_checkout = "checkout" in hour_source.lower() if hour_source else False
+        has_manager_approval = any(
+            pattern in hour_source.lower() 
+            for pattern in ["/manager/hours/", "/admin/", "manager", "admin", "approved", "approve"]
+        ) if hour_source else False
+        has_kiosk_activity = "/kiosk/" in hour_source.lower() if hour_source else False
+        
+        # Determine checkout status for pending hours
+        checkout_status = "unknown"
+        if hour_status and hour_status.lower() == "pending":
+            if has_checkin and has_checkout:
+                checkout_status = "checked_in_and_out"
+            elif has_checkin and not has_checkout:
+                checkout_status = "checked_in_only"
+            elif has_manager_approval:
+                checkout_status = "manager_approved"
+            else:
+                checkout_status = "no_checkin_activity"
+        
+        # Update user entry
+        user_entry.update({
+            "checkin_status": checkin_status,
+            "hour_id": hour.get("id"),
+            "hour_status": hour_status,
+            "hour_source": hour_source,
+            "hour_duration": hour_duration,
+            "hour_date_start": hour.get("hour_date_start"),
+            "hour_date_end": hour.get("hour_date_end"),
+            "hour_date_created": hour_created,
+            "hour_date_updated": hour_updated,
+            "checkout_status": checkout_status,
+            "has_checkin": has_checkin,
+            "has_checkout": has_checkout,
+            "has_manager_approval": has_manager_approval,
+            "has_kiosk_activity": has_kiosk_activity,
+            "checkout_analysis": {
+                "checked_in": has_checkin,
+                "checked_out": has_checkout,
+                "manager_approval": has_manager_approval,
+                "kiosk_activity": has_kiosk_activity,
+                "status": checkout_status
+            }
+        })
+        
+        # Add duration as float for easier reporting
+        if hour_duration:
+            try:
+                user_entry["duration"] = float(hour_duration)
+            except (ValueError, TypeError):
+                user_entry["duration"] = 0.0
+
+    def _save_shift_status_data_incremental(self, shift_status_list: list) -> None:
+        """
+        Save shift status data to MongoDB (incremental version).
+        
+        This incremental version only updates the specific shifts that have changed,
+        rather than recreating the entire collection.
+        
+        Args:
+            shift_status_list: List of shift status records to save
+        """
+        logger.info(f"Saving {len(shift_status_list)} updated shift records to MongoDB (incremental)...")
+        
+        if not shift_status_list:
+            logger.info("No shifts to update")
+            return
+        
+        # Process each shift individually
+        processed_count = 0
+        updated_count = 0
+        inserted_count = 0
+        error_count = 0
+        
+        for shift in shift_status_list:
+            try:
+                shift_id = shift.get("id")
+                if not shift_id:
+                    error_count += 1
+                    continue
+                
+                # Use the shift_id as MongoDB _id
+                shift["_id"] = shift_id
+                
+                # Try to update existing shift or insert new one
+                result = self.db["shift_status"].replace_one(
+                    {"_id": shift_id},
+                    shift,
+                    upsert=True
+                )
+                
+                if result.upserted_id:
+                    inserted_count += 1
+                elif result.modified_count > 0:
+                    updated_count += 1
+                    
+                processed_count += 1
+                
+            except Exception as e:
+                error_count += 1
+                logger.error(f"Error processing shift {shift.get('id')}: {str(e)}")
+        
+        logger.info(
+            f"Incremental shift update complete: {processed_count} processed, "
+            f"{updated_count} updated, {inserted_count} inserted, {error_count} errors"
+        )
+        
+        # Still process synthetic shifts for approved hours
+        self._process_synthetic_shifts_for_approved_hours()
 
 if __name__ == "__main__":
     # Create and run the sync tool
