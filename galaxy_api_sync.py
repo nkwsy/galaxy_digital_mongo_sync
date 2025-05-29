@@ -12,6 +12,10 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 from dotenv import load_dotenv
 import sys
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # For older Python with backports
 
 print("Script is starting...")
 
@@ -525,10 +529,17 @@ class GalaxyAPISync:
         # Get last sync time for incremental sync
         last_sync_time = self._get_last_sync_time(resource_name)
         if last_sync_time and since_field:
-            # Format the datetime for the API (ISO format)
-            since_updated = last_sync_time.strftime("%Y-%m-%d %H:%M:%S")
+            # Ensure last_sync_time is timezone-aware UTC
+            if last_sync_time.tzinfo is None:
+                last_sync_time = last_sync_time.replace(tzinfo=datetime.timezone.utc)
+            else:
+                last_sync_time = last_sync_time.astimezone(datetime.timezone.utc)
+            # Convert to America/Chicago timezone
+            chicago_time = last_sync_time.astimezone(ZoneInfo("America/Chicago"))
+            # Format as 'YYYY-MM-DD HH:MM:SS'
+            since_updated = chicago_time.strftime("%Y-%m-%d %H:%M:%S")
             query_params[since_field] = since_updated
-            logger.info(f"Using incremental sync for {resource_name} since: {since_updated}")
+            logger.info(f"Using incremental sync for {resource_name} since: {since_updated} (America/Chicago)")
         else:
             logger.info(f"Performing full sync for {resource_name} (no previous sync time found)")
         
@@ -977,25 +988,6 @@ class GalaxyAPISync:
             List of shift status records (dictionaries)
         """
         logger.info("Creating shifts from needs...")
-        
-        # --- SPECIAL DIAGNOSTIC CODE ---
-        # Check if need 800197 exists and examine its structure
-        problematic_need = self.db["needs"].find_one({"id": 800197})
-        if problematic_need:
-            logger.info(f"Found problematic need 800197: {problematic_need.get('need_title')}")
-            # Check if shifts array exists and its structure
-            if "shifts" in problematic_need:
-                logger.info(f"Need 800197 has shifts array with {len(problematic_need['shifts'])} items")
-                # Examine first shift
-                if len(problematic_need['shifts']) > 0:
-                    logger.info(f"First shift: {problematic_need['shifts'][0]}")
-                else:
-                    logger.warning("Shifts array is empty")
-            else:
-                logger.warning("Need 800197 has no 'shifts' field")
-        else:
-            logger.warning("Could not find need with ID 800197")
-        # --- END SPECIAL DIAGNOSTIC CODE ---
         
         # Query all needs that have shifts array
         needs_filter = {"shifts": {"$exists": True, "$ne": []}}

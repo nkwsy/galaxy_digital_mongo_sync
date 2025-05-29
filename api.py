@@ -224,7 +224,7 @@ async def get_checkin_status(
     try:
         # Sync the 'hours' resource and regenerate aggregations before querying
         sync_tool._sync_resource('hours', since_field='since_updated')
-        sync_tool._generate_shift_status(future_only=True)
+        # sync_tool._generate_shift_status(future_only=True)
         sync_tool._generate_checkin_checkout_analysis()
 
         filter_query = {}
